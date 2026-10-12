@@ -268,8 +268,11 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Fram
 
     // A parent isn't enough: frameworks build subtrees detached and insert
     // them later. A target reported while detached is never reported again,
-    // so the page would miss the moment it actually appears.
-    const connected = target.asNode().isConnected();
+    // so the page would miss the moment it actually appears. Nor is being
+    // connected to a document without a frame (DOMParser, createHTMLDocument):
+    // it never renders, but the target may be adopted into one that does.
+    const node = target.asNode();
+    const connected = node.ownerFrame(frame) != null and node.isConnected();
     const is_now_intersecting = connected and self.meetsThreshold(1.0);
     if (!is_now_intersecting) {
         // Not intersecting yet (e.g. observed while still detached) — keep
