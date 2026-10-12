@@ -106,16 +106,16 @@ const ErrorReason = enum {
     BlockedByResponse,
 };
 
-fn commandSessionId(cmd: *CDP.Command, bc: *CDP.BrowserContext) ![]const u8 {
+fn commandSessionId(cmd: *CDP.Command, target: *CDP.Target) ![]const u8 {
     if (cmd.input.session_id) |session_id| {
         return cmd.cdp.resolveSessionId(session_id) orelse error.UnknownSessionId;
     }
-    return bc.session_id orelse error.UnknownSessionId;
+    return target.session_id orelse error.UnknownSessionId;
 }
 
 fn disable(cmd: *CDP.Command) !void {
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    bc.fetchDisableForSession(try commandSessionId(cmd, bc));
+    const target = try cmd.target();
+    target.fetchDisableForSession(try commandSessionId(cmd, target));
     return cmd.sendResult(null, .{});
 }
 
@@ -126,17 +126,17 @@ fn enable(cmd: *CDP.Command) !void {
             return cmd.sendError(-32602, "Can't specify empty patterns with handleAuth set", .{});
         }
     }
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    try bc.fetchEnable(params.patterns, params.handleAuthRequests, try commandSessionId(cmd, bc));
+    const target = try cmd.target();
+    try target.fetchEnable(params.patterns, params.handleAuthRequests, try commandSessionId(cmd, target));
     return cmd.sendResult(null, .{});
 }
 
-pub fn requestIntercept(arena: Allocator, bc: *CDP.BrowserContext, intercept: *const Notification.RequestIntercept) !void {
+pub fn requestIntercept(arena: Allocator, target: *CDP.Target, intercept: *const Notification.RequestIntercept) !void {
     // The session that enabled Fetch owns its interception events.
-    const session_id = bc.fetch_session_id orelse return;
+    const session_id = target.fetch_session_id orelse return;
 
     const transfer = intercept.transfer;
-    if (!bc.intercept_state.matches(transfer.req.url, transfer.req.resource_type)) {
+    if (!target.intercept_state.matches(transfer.req.url, transfer.req.resource_type)) {
         // Leaves wait_for_interception false: the request proceeds untouched.
         return;
     }
@@ -144,13 +144,13 @@ pub fn requestIntercept(arena: Allocator, bc: *CDP.BrowserContext, intercept: *c
     // We keep it around to wait for modifications to the request.
     // TODO: What to do when receiving replies for a previous frame's requests?
 
-    const intercept_id = try bc.intercept_state.put(transfer.id);
-    errdefer _ = bc.intercept_state.remove(intercept_id);
+    const intercept_id = try target.intercept_state.put(transfer.id);
+    errdefer _ = target.intercept_state.remove(intercept_id);
 
-    try bc.cdp.sendEvent("Fetch.requestPaused", .{
+    try target.cdp.sendEvent("Fetch.requestPaused", .{
         .requestId = &id.toInterceptId(intercept_id),
         .frameId = &id.toFrameId(transfer.req.frame_id),
-        .request = network.RequestWriter.init(arena, transfer, bc.network_limits.post_data),
+        .request = network.RequestWriter.init(arena, transfer, target.network_limits.post_data),
         .resourceType = transfer.req.resource_type.string(),
         .networkId = &id.toRequestId(transfer), // matches the Network REQ-ID
     }, .{ .session_id = session_id });
@@ -166,7 +166,7 @@ pub fn requestIntercept(arena: Allocator, bc: *CDP.BrowserContext, intercept: *c
 }
 
 fn continueRequest(cmd: *CDP.Command) !void {
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const target = try cmd.target();
     const params = (try cmd.params(struct {
         requestId: []const u8, // INT-{d}"
         url: ?[]const u8 = null,
@@ -180,8 +180,8 @@ fn continueRequest(cmd: *CDP.Command) !void {
         return error.NotImplemented;
     }
 
-    const client = &bc.cdp.browser.http_client;
-    var intercept_state = &bc.intercept_state;
+    const client = &target.cdp.browser.http_client;
+    var intercept_state = &target.intercept_state;
     const intercept_id = try idFromRequestId(params.requestId);
 
     const transfer_id = intercept_state.remove(intercept_id) orelse return error.RequestNotFound;
@@ -233,7 +233,7 @@ const AuthChallengeResponse = enum {
 };
 
 fn continueWithAuth(cmd: *CDP.Command) !void {
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const target = try cmd.target();
     const params = (try cmd.params(struct {
         requestId: []const u8, // "INT-{d}"
         authChallengeResponse: struct {
@@ -243,8 +243,8 @@ fn continueWithAuth(cmd: *CDP.Command) !void {
         },
     })) orelse return error.InvalidParams;
 
-    const client = &bc.cdp.browser.http_client;
-    var intercept_state = &bc.intercept_state;
+    const client = &target.cdp.browser.http_client;
+    var intercept_state = &target.intercept_state;
     const intercept_id = try idFromRequestId(params.requestId);
 
     const transfer_id = intercept_state.remove(intercept_id) orelse return error.RequestNotFound;
@@ -284,7 +284,7 @@ fn continueWithAuth(cmd: *CDP.Command) !void {
 }
 
 fn fulfillRequest(cmd: *CDP.Command) !void {
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const target = try cmd.target();
 
     const params = (try cmd.params(struct {
         requestId: []const u8, // "INT-{d}"
@@ -300,8 +300,8 @@ fn fulfillRequest(cmd: *CDP.Command) !void {
         return error.NotImplemented;
     }
 
-    const client = &bc.cdp.browser.http_client;
-    var intercept_state = &bc.intercept_state;
+    const client = &target.cdp.browser.http_client;
+    var intercept_state = &target.intercept_state;
     const intercept_id = try idFromRequestId(params.requestId);
 
     const transfer_id = intercept_state.remove(intercept_id) orelse return error.RequestNotFound;
@@ -331,14 +331,14 @@ fn fulfillRequest(cmd: *CDP.Command) !void {
 }
 
 fn failRequest(cmd: *CDP.Command) !void {
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const target = try cmd.target();
     const params = (try cmd.params(struct {
         requestId: []const u8, // "INT-{d}"
         errorReason: ErrorReason,
     })) orelse return error.InvalidParams;
 
-    const client = &bc.cdp.browser.http_client;
-    var intercept_state = &bc.intercept_state;
+    const client = &target.cdp.browser.http_client;
+    var intercept_state = &target.intercept_state;
     const intercept_id = try idFromRequestId(params.requestId);
 
     const transfer_id = intercept_state.remove(intercept_id) orelse return error.RequestNotFound;
@@ -360,12 +360,12 @@ fn failRequest(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-pub fn requestAuthRequired(arena: Allocator, bc: *CDP.BrowserContext, intercept: *const Notification.RequestAuthRequired) !void {
-    const session_id = bc.fetch_session_id orelse return;
+pub fn requestAuthRequired(arena: Allocator, target: *CDP.Target, intercept: *const Notification.RequestAuthRequired) !void {
+    const session_id = target.fetch_session_id orelse return;
 
     // Auth challenges are only surfaced for requests the patterns select.
     const transfer = intercept.transfer;
-    if (!bc.intercept_state.matches(transfer.req.url, transfer.req.resource_type)) {
+    if (!target.intercept_state.matches(transfer.req.url, transfer.req.resource_type)) {
         return;
     }
 
@@ -373,16 +373,16 @@ pub fn requestAuthRequired(arena: Allocator, bc: *CDP.BrowserContext, intercept:
     // NOTE: we assume whomever created the request created it with a lifetime of the Page.
     // TODO: What to do when receiving replies for a previous frame's requests?
 
-    const intercept_id = try bc.intercept_state.put(transfer.id);
-    errdefer _ = bc.intercept_state.remove(intercept_id);
+    const intercept_id = try target.intercept_state.put(transfer.id);
+    errdefer _ = target.intercept_state.remove(intercept_id);
     const request = &transfer.req;
 
     const challenge = transfer._auth_challenge orelse return error.NullAuthChallenge;
 
-    try bc.cdp.sendEvent("Fetch.authRequired", .{
+    try target.cdp.sendEvent("Fetch.authRequired", .{
         .requestId = &id.toInterceptId(intercept_id),
         .frameId = &id.toFrameId(request.frame_id),
-        .request = network.RequestWriter.init(arena, transfer, bc.network_limits.post_data),
+        .request = network.RequestWriter.init(arena, transfer, target.network_limits.post_data),
         .resourceType = request.resource_type.string(),
         .authChallenge = .{
             .origin = "", // TODO get origin, could be the proxy address for example.
@@ -594,14 +594,14 @@ test "cdp.Fetch: interception events belong to the enabling session" {
         .session_id = "SID-PRIMARY",
         .target_id = "TID-000000000B".*,
     });
-    _ = try bc.attachSession("SID-AUX", null);
+    _ = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
 
     try ctx.processMessage(.{
         .id = 1,
         .method = "Fetch.enable",
         .sessionId = "SID-AUX",
     });
-    try testing.expect(std.mem.eql(u8, "SID-AUX", bc.fetch_session_id.?));
+    try testing.expect(std.mem.eql(u8, "SID-AUX", bc.firstTarget().?.fetch_session_id.?));
     try ctx.expectSentResult(null, .{ .id = 1, .session_id = "SID-AUX" });
 
     try ctx.processMessage(.{
@@ -609,14 +609,14 @@ test "cdp.Fetch: interception events belong to the enabling session" {
         .method = "Fetch.disable",
         .sessionId = "SID-PRIMARY",
     });
-    try testing.expect(std.mem.eql(u8, "SID-AUX", bc.fetch_session_id.?));
+    try testing.expect(std.mem.eql(u8, "SID-AUX", bc.firstTarget().?.fetch_session_id.?));
 
     try ctx.processMessage(.{
         .id = 3,
         .method = "Fetch.disable",
         .sessionId = "SID-AUX",
     });
-    try testing.expectEqual(null, bc.fetch_session_id);
+    try testing.expectEqual(null, bc.firstTarget().?.fetch_session_id);
 }
 
 test "cdp.Fetch: InterceptState issues a fresh id per pause" {
@@ -722,25 +722,25 @@ test "cdp.Fetch: enable compiles patterns, disable clears them" {
         .sessionId = "SID-P",
     });
     try ctx.expectSentResult(null, .{ .id = 1, .session_id = "SID-P" });
-    try testing.expectEqual(2, bc.intercept_state.patterns.len);
-    try testing.expect(bc.intercept_state.matches("http://h/json/a", .fetch));
-    try testing.expectEqual(false, bc.intercept_state.matches("http://h/json/a", .xhr));
-    try testing.expect(bc.intercept_state.matches("http://h/exact", .xhr));
-    try testing.expectEqual(false, bc.intercept_state.matches("http://h/", .document));
+    try testing.expectEqual(2, bc.firstTarget().?.intercept_state.patterns.len);
+    try testing.expect(bc.firstTarget().?.intercept_state.matches("http://h/json/a", .fetch));
+    try testing.expectEqual(false, bc.firstTarget().?.intercept_state.matches("http://h/json/a", .xhr));
+    try testing.expect(bc.firstTarget().?.intercept_state.matches("http://h/exact", .xhr));
+    try testing.expectEqual(false, bc.firstTarget().?.intercept_state.matches("http://h/", .document));
 
     // re-enable without patterns = catch-all
     try ctx.processMessage(.{ .id = 2, .method = "Fetch.enable", .sessionId = "SID-P" });
     try ctx.expectSentResult(null, .{ .id = 2, .session_id = "SID-P" });
-    try testing.expect(bc.intercept_state.matches("http://h/", .document));
+    try testing.expect(bc.firstTarget().?.intercept_state.matches("http://h/", .document));
 
     // explicit empty list = pause nothing; rejected when auth handling is on
     try ctx.processMessage(.{ .id = 3, .method = "Fetch.enable", .params = .{ .patterns = .{} }, .sessionId = "SID-P" });
     try ctx.expectSentResult(null, .{ .id = 3, .session_id = "SID-P" });
-    try testing.expectEqual(false, bc.intercept_state.matches("http://h/", .document));
+    try testing.expectEqual(false, bc.firstTarget().?.intercept_state.matches("http://h/", .document));
     try ctx.processMessage(.{ .id = 4, .method = "Fetch.enable", .params = .{ .patterns = .{}, .handleAuthRequests = true }, .sessionId = "SID-P" });
     try ctx.expectSentError(-32602, "Can't specify empty patterns with handleAuth set", .{ .id = 4 });
 
     try ctx.processMessage(.{ .id = 5, .method = "Fetch.disable", .sessionId = "SID-P" });
-    try testing.expectEqual(0, bc.intercept_state.patterns.len);
-    try testing.expectEqual(false, bc.intercept_state.matches("http://h/", .document));
+    try testing.expectEqual(0, bc.firstTarget().?.intercept_state.patterns.len);
+    try testing.expectEqual(false, bc.firstTarget().?.intercept_state.matches("http://h/", .document));
 }
