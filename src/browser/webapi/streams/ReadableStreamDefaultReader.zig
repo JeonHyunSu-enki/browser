@@ -53,8 +53,14 @@ pub fn read(self: *ReadableStreamDefaultReader, exec: *const Execution) !js.Prom
     stream._disturbed = true;
 
     if (stream._state == .errored) {
-        //const err = stream._stored_error orelse "Stream errored";
-        return local.rejectPromise(.{ .type_error = "Stream errored" });
+        var resolver = local.createPromiseResolver();
+        const promise = resolver.promise();
+        if (stream._stored_error) |stored| {
+            resolver.reject("stream read", stored.local(local));
+        } else {
+            resolver.rejectError("stream read", .{ .type_error = "Stream errored" });
+        }
+        return promise;
     }
 
     if (stream._controller.dequeue()) |chunk| {

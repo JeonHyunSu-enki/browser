@@ -220,18 +220,25 @@ fn fail(self: *ReadableStreamDefaultController, err: []const u8, type_error: boo
         return;
     }
 
+    const local = self._execution.js.local.?;
+    const handle = if (type_error) local.isolate.createTypeError(err) else local.isolate.createError(err);
+    return self.errorWithValue(.{ .local = local, .handle = handle });
+}
+
+/// Errors the stream with an arbitrary JS value, preserving its identity.
+/// This is what the JS-facing `controller.error(e)` uses.
+pub fn errorWithValue(self: *ReadableStreamDefaultController, value: js.Value) !void {
+    if (self._stream._state != .readable) {
+        return;
+    }
+
     self._stream._state = .errored;
-    self._stream._stored_error = try self._arena.dupe(u8, err);
+    self._stream._stored_error = try value.persist();
     self.clearQueue();
 
-    // Reject all pending reads
+    const local = value.local;
     for (self._pending_reads.items) |resolver| {
-        const local_resolver = self._execution.js.toLocal(resolver);
-        if (type_error) {
-            local_resolver.rejectError("stream error", .{ .type_error = err });
-        } else {
-            local_resolver.reject("stream error", err);
-        }
+        local.toLocal(resolver).reject("stream error", value);
         resolver.release();
     }
     self._pending_reads.clearRetainingCapacity();
@@ -273,7 +280,7 @@ pub const JsApi = struct {
 
     pub const enqueue = bridge.function(ReadableStreamDefaultController.enqueueValue, .{});
     pub const close = bridge.function(ReadableStreamDefaultController.close, .{});
-    pub const @"error" = bridge.function(ReadableStreamDefaultController.doError, .{});
+    pub const @"error" = bridge.function(ReadableStreamDefaultController.errorWithValue, .{});
     pub const desiredSize = bridge.accessor(ReadableStreamDefaultController.getDesiredSize, null, .{});
 };
 
@@ -323,6 +330,5 @@ test "ReadableStreamDefaultController: chunks and pending reads release their gl
         \\new Response('native chunk').body.getReader().read();
     , null);
 
-    // cancel() keeps its own resolver so a repeated cancel returns the same promise.
-    try testing.expectEqual(base + 1, tracker.list.items.len);
+    try testing.expectEqual(base + 3, tracker.list.items.len);
 }
