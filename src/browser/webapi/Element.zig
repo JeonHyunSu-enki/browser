@@ -1499,12 +1499,33 @@ pub fn querySelectorAll(self: *Element, input: []const u8, frame: *Frame) !*Sele
     return Selector.querySelectorAll(self.asNode(), input, frame) catch |err| Selector.mapErrorToDOM(err);
 }
 
-pub fn getAnimations(_: *const Element) []*Animation {
-    return &.{};
+pub fn getAnimations(self: *Element, options: ?struct { subtree: bool = false }, frame: *Frame) ![]*Animation {
+    return Animation.collect(self.asNode(), if (options) |value| value.subtree else false, frame);
 }
 
-pub fn animate(_: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
+pub fn animate(self: *Element, keyframes: ?js.Object, options: ?js.Value, frame: *Frame) !*Animation {
     const animation = try Animation.init(frame);
+    if (options) |value| {
+        if (value.isNumber()) {
+            animation._duration_ms = @intFromFloat(@max(0, @min(try value.toF64(), 2147483647)));
+        } else if (value.isObject()) {
+            const object = value.toObject();
+            const duration = try object.get("duration");
+            if (duration.isNumber()) animation._duration_ms = @intFromFloat(@max(0, @min(try duration.toF64(), 2147483647)));
+            const fill = try object.get("fill");
+            if (fill.isString() != null) {
+                const text = try fill.toZig([]const u8);
+                animation._fill_forwards = std.mem.eql(u8, text, "forwards") or std.mem.eql(u8, text, "both");
+            }
+        }
+    }
+    const effect = try @import("animation/KeyframeEffect.zig").init(self, keyframes, options, frame);
+    effect.acquireRef();
+    effect._animation = animation;
+    effect._duration = @floatFromInt(animation._duration_ms);
+    effect._fill = if (animation._fill_forwards) "forwards" else "none";
+    animation._effect_native = effect;
+    try animation.attach(self, frame);
     try animation.play(frame);
     return animation;
 }

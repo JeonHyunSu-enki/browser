@@ -21,6 +21,9 @@ const lp = @import("lightpanda");
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
 const Frame = @import("../../Frame.zig");
+const Element = @import("../Element.zig");
+const Node = @import("../Node.zig");
+const KeyframeEffect = @import("KeyframeEffect.zig");
 
 const EventTarget = @import("../EventTarget.zig");
 const AnimationPlaybackEvent = @import("../event/AnimationPlaybackEvent.zig");
@@ -44,11 +47,18 @@ _frame: *Frame,
 _arena: *lp.Arena,
 
 _effect: ?js.Object.Global = null,
+_effect_native: ?*KeyframeEffect = null,
 _timeline: ?js.Object.Global = null,
 _ready_resolver: ?js.PromiseResolver.Global = null,
 _finished_resolver: ?js.PromiseResolver.Global = null,
 _startTime: ?f64 = null,
 _playState: PlayState = .idle,
+_target: ?*Element = null,
+_duration_ms: u32 = 0,
+_deadline: u64 = 0,
+_remaining_ms: u32 = 0,
+_timer_pending: bool = false,
+_fill_forwards: bool = false,
 
 // Fake the animation by passing the states:
 // .idle => .running once play() is called.
@@ -68,6 +78,10 @@ pub fn init(frame: *Frame) !*Animation {
 
 pub fn deinit(self: *Animation, page: *Page) void {
     page.event_listeners.removeTarget(self.asEventTarget());
+    if (self._effect_native) |effect| {
+        effect._animation = null;
+        effect.releaseRef(page);
+    }
     self._arena.release();
 }
 
@@ -83,6 +97,28 @@ pub fn asEventTarget(self: *Animation) *EventTarget {
     return self._proto;
 }
 
+pub fn attach(self: *Animation, target: *Element, frame: *Frame) !void {
+    try frame.animations.append(frame.page_arena, self);
+    self.acquireRef();
+    self._target = target;
+}
+
+pub fn collect(root: *Node, subtree: bool, frame: *Frame) ![]*Animation {
+    var result: @import("std").ArrayList(*Animation) = .empty;
+    const owner = root.ownerFrame(frame) orelse frame;
+    for (owner.animations.items) |animation| {
+        const target = (animation._target orelse continue).asNode();
+        if (animation._playState == .idle or (animation._playState == .finished and !animation._fill_forwards)) continue;
+        if (root._type == .document) {
+            if (!target.isConnected() or target.getDocument(frame).asNode() != root) continue;
+        } else if (root.is(@import("../ShadowRoot.zig")) != null) {
+            if (target.getRootNode(.{}) != root) continue;
+        } else if (target != root and (!subtree or !root.contains(target))) continue;
+        try result.append(frame.call_arena, animation);
+    }
+    return result.items;
+}
+
 pub fn play(self: *Animation, frame: *Frame) !void {
     if (self._playState == .running) {
         return;
@@ -90,6 +126,9 @@ pub fn play(self: *Animation, frame: *Frame) !void {
 
     // transition to running.
     self._playState = .running;
+    const remaining = if (self._remaining_ms > 0) self._remaining_ms else self._duration_ms;
+    self._deadline = lp.datetime.milliTimestamp(.boot) + remaining;
+    if (self._timer_pending) return;
 
     // Schedule the transition from .running => .finished in 10ms.
     self.acquireRef();
@@ -97,9 +136,10 @@ pub fn play(self: *Animation, frame: *Frame) !void {
     try frame.js.scheduler.add(
         self,
         Animation.update,
-        10,
+        remaining,
         .{ .name = "animation.update", .finalizer = Animation.cancelled },
     );
+    self._timer_pending = true;
 }
 
 // The scheduler drops pending tasks when the context is torn down.
@@ -109,6 +149,9 @@ fn cancelled(ctx: *anyopaque) void {
 }
 
 pub fn pause(self: *Animation) void {
+    if (self._playState == .running) {
+        self._remaining_ms = @intCast(self._deadline -| lp.datetime.milliTimestamp(.boot));
+    }
     self._playState = .paused;
 }
 
@@ -138,6 +181,7 @@ pub fn finish(self: *Animation, frame: *Frame) !void {
         return;
     }
 
+    self._remaining_ms = 0;
     self._playState = .finished;
 
     // resolve finished
@@ -180,6 +224,7 @@ pub fn getFinished(self: *Animation, frame: *Frame) !js.Promise {
     if (self._finished_resolver == null) {
         const resolver = frame.js.local.?.createPromiseResolver();
         self._finished_resolver = try resolver.persist();
+        if (self._playState == .finished) resolver.resolve("Animation.getFinished", self);
         return resolver.promise();
     }
     return frame.js.toLocal(self._finished_resolver).?.promise();
@@ -196,8 +241,10 @@ pub fn getReady(self: *Animation, frame: *Frame) !js.Promise {
     return frame.js.toLocal(self._ready_resolver).?.promise();
 }
 
-fn getEffect(self: *const Animation) ?js.Object.Global {
-    return self._effect;
+fn getEffect(self: *const Animation, frame: *Frame) !?js.Object {
+    if (self._effect) |effect| return frame.js.toLocal(effect);
+    if (self._effect_native) |effect| return (try frame.js.local.?.zigValueToJs(effect, .{})).toObject();
+    return null;
 }
 
 fn setEffect(self: *Animation, effect: ?js.Object.Global) !void {
@@ -230,11 +277,21 @@ fn setStartTime(self: *Animation, value: ?f64, frame: *Frame) !void {
 // callback function transitioning from a state to another
 fn update(ctx: *anyopaque) !?u32 {
     const self: *Animation = @ptrCast(@alignCast(ctx));
-    defer self.releaseRef(self._frame.page);
+    var completed = true;
+    defer if (completed) {
+        self._timer_pending = false;
+        self.releaseRef(self._frame.page);
+    };
 
     switch (self._playState) {
         .running => {
+            const remaining = self._deadline -| lp.datetime.milliTimestamp(.boot);
+            if (remaining > 0) {
+                completed = false;
+                return @intCast(remaining);
+            }
             // transition to finished.
+            self._remaining_ms = 0;
             self._playState = .finished;
 
             var ls: js.Local.Scope = undefined;

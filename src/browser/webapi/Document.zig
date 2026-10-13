@@ -554,8 +554,8 @@ fn getSelection(self: *Document) *Selection {
     return &self._selection;
 }
 
-pub fn getAnimations(_: *const Document) []*Animation {
-    return &.{};
+pub fn getAnimations(self: *Document, frame: *Frame) ![]*Animation {
+    return Animation.collect(self.asNode(), true, frame);
 }
 
 pub fn querySelector(self: *Document, input: String, frame: *Frame) !?*Element {

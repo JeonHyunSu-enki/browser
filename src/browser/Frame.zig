@@ -44,6 +44,7 @@ const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
+const Animation = @import("webapi/animation/Animation.zig");
 const HtmlElement = @import("webapi/element/Html.zig");
 const Window = @import("webapi/Window.zig");
 const Cookie = @import("webapi/storage/Cookie.zig");
@@ -122,6 +123,7 @@ _fragment_scripts_runnable: bool = false,
 // FileLists owned by `<input type=file>` elements. Each holds refs on its
 // File objects (reference counted via their Blob proto); released at teardown.
 _file_lists: std.ArrayList(*FileList) = .empty,
+animations: std.ArrayList(*Animation) = .empty,
 
 // List of Documents which called document.open() and potentially need to have
 // the parser freed.
@@ -508,6 +510,8 @@ pub fn deinit(self: *Frame) void {
         }
 
         observers.deinit(self, page);
+        for (self.animations.items) |animation| animation.releaseRef(page);
+        self.animations.clearRetainingCapacity();
 
         var document = self.window._document;
         document._selection.releaseRef(page);

@@ -187,6 +187,12 @@ fn setAdoptedStyleSheets(self: *ShadowRoot, sheets: js.Object) !void {
 }
 
 pub const JsApi = struct {
+    pub const getAnimations = bridge.function(struct {
+        fn getAnimations(self: *ShadowRoot, frame: *Frame) ![]*@import("animation/Animation.zig") {
+            return @import("animation/Animation.zig").collect(self.asNode(), true, frame);
+        }
+    }.getAnimations, .{});
+
     pub const bridge = js.Bridge(ShadowRoot);
 
     pub const Meta = struct {
