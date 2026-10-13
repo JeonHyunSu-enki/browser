@@ -62,6 +62,9 @@ text: Group(Text) = .{},
 // Keyed by property name, pruning to what is (hopefully) one or few rules
 custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
 layout_rules: std.ArrayList(LayoutRule) = .empty,
+layout_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
+layout_memo_arena: ?*lp.Arena = null,
+layout_memo_version: usize = std.math.maxInt(usize),
 
 /// The thing to remember about layers is that we can't determine priority's
 /// layer_rank until everything is parsed. So we need to build up meta data when
@@ -87,7 +90,7 @@ dirty: bool = false,
 // or to a later sheet, stays last in cascade order.
 last_rule_sheet: ?*CSSStyleSheet = null,
 
-pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64 };
+pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64, order: usize = 0 };
 const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
 
 fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, layer: u16) !void {
@@ -108,8 +111,17 @@ fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, 
     }
 }
 
-pub fn layoutProperties(self: *StyleManager, element: *Element, allocator: Allocator) ![]LayoutProperty {
+pub fn layoutProperties(self: *StyleManager, element: *Element, _: Allocator) ![]LayoutProperty {
     try self.rebuildIfDirty();
+    const memo_arena = self.layout_memo_arena orelse try self.frame.getArena(.medium, "Layout styles");
+    self.layout_memo_arena = memo_arena;
+    if (self.layout_memo_version != self.frame.page.style_version) {
+        memo_arena.resetRetain();
+        self.layout_memo = .empty;
+        self.layout_memo_version = self.frame.page.style_version;
+    }
+    if (self.layout_memo.get(element)) |properties| return properties;
+    const allocator = memo_arena.allocator();
     var result: std.ArrayList(LayoutProperty) = .empty;
     for (self.layout_rules.items) |rule| {
         if (!matchesSelector(element, rule.selector, self.frame)) continue;
@@ -129,7 +141,24 @@ pub fn layoutProperties(self: *StyleManager, element: *Element, allocator: Alloc
             return a.priority < b.priority;
         }
     }.lessThan);
-    return result.items;
+    var winners: std.StringHashMapUnmanaged(usize) = .empty;
+    var resolved: std.ArrayList(LayoutProperty) = .empty;
+    for (result.items, 0..) |property, order| {
+        const slot = try winners.getOrPut(allocator, property.name);
+        var value = property;
+        value.order = order;
+        if (!slot.found_existing) {
+            slot.value_ptr.* = resolved.items.len;
+            try resolved.append(allocator, value);
+        } else if (value.priority >= resolved.items[slot.value_ptr.*].priority) resolved.items[slot.value_ptr.*] = value;
+    }
+    std.mem.sort(LayoutProperty, resolved.items, {}, struct {
+        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
+            return if (a.priority == b.priority) a.order < b.order else a.priority < b.priority;
+        }
+    }.lessThan);
+    try self.layout_memo.put(allocator, element, resolved.items);
+    return resolved.items;
 }
 
 pub fn cascadedProperty(self: *StyleManager, element: *Element, name: []const u8) ?[]const u8 {
@@ -149,6 +178,7 @@ pub fn init(frame: *Frame) !StyleManager {
 }
 
 pub fn deinit(self: *StyleManager) void {
+    if (self.layout_memo_arena) |arena| arena.release();
     self.arena.release();
 }
 

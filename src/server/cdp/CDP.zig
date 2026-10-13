@@ -547,6 +547,7 @@ pub const BrowserContext = struct {
 
     intercept_state: InterceptState,
     fetch_session_id: ?[]const u8 = null,
+    network_sessions: std.StringArrayHashMapUnmanaged(void) = .empty,
 
     // Request bodies retained for Network.getRequestPostData, which can be
     // called after the transfer is gone. Capped at max_post_data_size.
@@ -674,6 +675,7 @@ pub const BrowserContext = struct {
         self.node_search_list.deinit();
         self.set_child_nodes_sent.deinit(self.cdp.allocator);
         self.attached_sessions.deinit(self.cdp.allocator);
+        self.network_sessions.deinit(self.cdp.allocator);
 
         // Session.deinit (called via closeSession above) already cleared this
         // notification off any ownerless CorsGate/RobotsGate transfers.
@@ -810,6 +812,14 @@ pub const BrowserContext = struct {
         };
     }
 
+    pub fn sendNetworkEvent(self: *BrowserContext, method: []const u8, parameters: anytype) !void {
+        if (self.network_sessions.count() == 0) {
+            if (self.session_id) |sid| try self.cdp.sendEvent(method, parameters, .{ .session_id = sid });
+            return;
+        }
+        for (self.network_sessions.keys()) |sid| try self.cdp.sendEvent(method, parameters, .{ .session_id = sid });
+    }
+
     pub fn networkEnable(self: *BrowserContext, limits: network_domain.BufferLimits) !void {
         const previous = self.network_limits;
         self.network_limits = limits;
@@ -842,6 +852,7 @@ pub const BrowserContext = struct {
         self.notification.unregister(.http_response_header_done, self);
         self.notification.unregister(.http_request_served_from_cache, self);
         self.clearCapturedResponses();
+        self.network_sessions.clearRetainingCapacity();
     }
 
     pub fn clearCapturedResponses(self: *BrowserContext) void {
@@ -1261,6 +1272,7 @@ pub const BrowserContext = struct {
     /// Returns false when no such session is attached.
     pub fn detachSession(self: *BrowserContext, session_id: []const u8) bool {
         const kv = self.attached_sessions.fetchOrderedRemove(session_id) orelse return false;
+        _ = self.network_sessions.swapRemove(session_id);
         if (self.session_id) |primary| {
             if (std.mem.eql(u8, primary, session_id)) {
                 self.session_id = null;
