@@ -65,6 +65,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         getCookies,
         getAllCookies,
         getResponseBody,
+        loadNetworkResource,
         getRequestPostData,
         emulateNetworkConditions,
         setBypassServiceWorker,
@@ -86,6 +87,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .getCookies => return getCookies(cmd),
         .getAllCookies => return getAllCookies(cmd),
         .getResponseBody => return getResponseBody(cmd),
+        .loadNetworkResource => return loadNetworkResource(cmd),
         .getRequestPostData => return getRequestPostData(cmd),
         .emulateNetworkConditions => return emulateNetworkConditions(cmd),
         // There are no service workers to bypass.
@@ -393,6 +395,50 @@ const Base64Body = struct {
         jws.endWriteRaw();
     }
 };
+
+fn loadNetworkResource(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        url: [:0]const u8,
+        frameId: ?[]const u8 = null,
+        options: struct { disableCache: bool, includeCredentials: bool },
+    })) orelse return error.InvalidParams;
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const frame = if (params.frameId) |frame_id|
+        bc.session.findFrameByFrameId(try id.parseFrameId(frame_id)) orelse return error.FrameNotLoaded
+    else
+        bc.mainFrame() orelse return error.FrameNotLoaded;
+    const transfer = try frame.newRequest(.{
+        .url = params.url,
+        .method = .GET,
+        .resource_type = .fetch,
+        .credentials_mode = if (params.options.includeCredentials) .include else .same_origin,
+        .request_mode = .no_cors,
+        .origin = frame.origin,
+        .skip_cache = params.options.disableCache,
+        .timeout_ms = 30_000,
+        .shutdown_callback = HttpClient.noopShutdown,
+    });
+    var response = transfer.submitSync(.{ .copy_headers = true }) catch |err| {
+        return cmd.sendResult(.{ .resource = .{ .success = false, .netErrorName = @errorName(err) } }, .{});
+    };
+    defer response.deinit();
+    if (response.status >= 400) {
+        return cmd.sendResult(.{ .resource = .{ .success = false, .httpStatusCode = response.status } }, .{});
+    }
+    const bytes = try cmd.cdp.allocator.dupe(u8, response.body.items);
+    const handle = cmd.cdp.streams.add(bytes) catch |err| {
+        cmd.cdp.allocator.free(bytes);
+        return err;
+    };
+    var headers: std.json.ObjectMap = .empty;
+    for (response.headers) |header| try headers.put(cmd.arena, header.name, .{ .string = header.value });
+    return cmd.sendResult(.{ .resource = .{
+        .success = true,
+        .httpStatusCode = response.status,
+        .stream = try cmd.arena.print("{d}", .{handle}),
+        .headers = std.json.Value{ .object = headers },
+    } }, .{});
+}
 
 fn getRequestPostData(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
