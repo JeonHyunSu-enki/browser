@@ -361,6 +361,17 @@ fn createSnapshotContext(
         }
     }
 
+    if (comptime realm == .window) {
+        // The synthetic global prototype must inherit Window's constructor.
+        const global_proto = v8.v8__Object__GetPrototype(global_obj).?;
+        const constructor_key = v8.v8__String__NewFromUtf8(isolate, "constructor", v8.kNormal, 11);
+        var deleted: v8.MaybeBool = undefined;
+        v8.v8__Object__Delete(@ptrCast(global_proto), context, constructor_key, &deleted);
+        if (deleted.has_value == false or deleted.value == false) {
+            return error.GlobalConstructorDeleteError;
+        }
+    }
+
     {
         // Delete built-in console so we can inject our own
         const console_key = v8.v8__String__NewFromUtf8(isolate, "console", v8.kNormal, 7);
