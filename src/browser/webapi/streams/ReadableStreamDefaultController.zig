@@ -311,7 +311,7 @@ test "ReadableStreamDefaultController: chunks and pending reads release their gl
         \\}
         \\{
         \\  let c;
-        \\  new ReadableStream({ start(ctrl) { c = ctrl; } }).getReader().read();
+        \\  new ReadableStream({ start(ctrl) { c = ctrl; } }).getReader().read().catch(() => {});
         \\  c.error('boom');
         \\}
         \\{

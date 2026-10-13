@@ -556,19 +556,12 @@ fn getBoxModel(cmd: *CDP.Command) !void {
     // TODO implement for document or text
     const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
 
-    // Without padding, border or margin in the layout, the four boxes coincide.
-    // Drivers read `border` for boundingBox(), so it must not be zero.
     const rect = element.boundingClientRectValues(frame);
-    const quad = rectToQuad(rect);
-
-    return cmd.sendResult(.{ .model = BoxModel{
-        .content = quad,
-        .padding = quad,
-        .border = quad,
-        .margin = quad,
-        .width = @trunc(rect.width),
-        .height = @trunc(rect.height),
-    } }, .{});
+    const owner = element.ownerFrame(frame) orelse return error.FrameNotLoaded;
+    const box = owner.layout.box(element.asNode(), owner);
+    const padding_rect = DOMNode.Element.DOMRect.Data{ .x = rect.x + box.border_left, .y = rect.y + box.border_top, .width = @max(0, rect.width - box.border_left - box.border_right), .height = @max(0, rect.height - box.border_top - box.border_bottom) };
+    const content_rect = DOMNode.Element.DOMRect.Data{ .x = padding_rect.x + box.padding_left, .y = padding_rect.y + box.padding_top, .width = @max(0, padding_rect.width - box.padding_left - box.padding_right), .height = @max(0, padding_rect.height - box.padding_top - box.padding_bottom) };
+    return cmd.sendResult(.{ .model = BoxModel{ .content = rectToQuad(content_rect), .padding = rectToQuad(padding_rect), .border = rectToQuad(rect), .margin = rectToQuad(rect), .width = @intFromFloat(@round(rect.width)), .height = @intFromFloat(@round(rect.height)) } }, .{});
 }
 
 fn requestChildNodes(cmd: *CDP.Command) !void {
@@ -1485,20 +1478,18 @@ test "cdp.dom: getBoxModel" {
     });
     try ctx.expectSentResult(.{ .nodeId = 3 }, .{ .id = 4 });
 
-    // Box model on the <p> nodeId returned above.
-    // Note: nodeId 6 is <head>, which is `display: none` per HTML Rendering
-    // §15.3.1, so its box model is all-zeros — exercise a visible element.
-    try ctx.processMessage(.{
-        .id = 5,
-        .method = "DOM.getBoxModel",
-        .params = .{ .nodeId = 3 },
-    });
+    const frame = ctx.cdp().browser_context.?.mainFrame().?;
+    var scope: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&scope);
+    defer scope.deinit();
+    _ = try scope.local.compileAndRun("document.body.style.margin='0';document.querySelector('p').style.cssText='margin:0;width:100px;height:50px;padding:10px;border:2px solid black'", null);
+    try ctx.processMessage(.{ .id = 5, .method = "DOM.getBoxModel", .params = .{ .nodeId = 3 } });
     try ctx.expectSentResult(.{ .model = BoxModel{
-        .content = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .padding = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .border = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .margin = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .width = 5,
-        .height = 5,
+        .content = Quad{ 12, 12, 112, 12, 112, 62, 12, 62 },
+        .padding = Quad{ 2, 2, 122, 2, 122, 72, 2, 72 },
+        .border = Quad{ 0, 0, 124, 0, 124, 74, 0, 74 },
+        .margin = Quad{ 0, 0, 124, 0, 124, 74, 0, 74 },
+        .width = 124,
+        .height = 74,
     } }, .{ .id = 5 });
 }

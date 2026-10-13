@@ -105,6 +105,27 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
         }
     }
 
+    if (self._is_computed) {
+        if (self._element) |element| {
+            if (wrapped.eqlSlice("width")) return resolvedDimension(element, .width, frame);
+            if (wrapped.eqlSlice("height")) return resolvedDimension(element, .height, frame);
+            if (element.ownerFrame(frame)) |owner| {
+                if (isCustomProperty(normalized)) return owner._style_manager.customPropertyValue(element, wrapped) orelse "";
+                if (wrapped.eqlSlice("grid-template-columns") or wrapped.eqlSlice("grid-template-rows")) {
+                    const box = owner.layout.box(element.asNode(), owner);
+                    const columns = wrapped.eqlSlice("grid-template-columns");
+                    const ptr = if (columns) box.grid_columns else box.grid_rows;
+                    const len = if (columns) box.grid_columns_len else box.grid_rows_len;
+                    if (ptr) |value| return value[0..len];
+                }
+                if (wrapped.eqlSlice("font-size")) {
+                    return frame.local_arena.print("{d}px", .{owner._style_manager.computedFontSize(element)}) catch "16px";
+                }
+                if (owner._style_manager.cascadedProperty(element, normalized)) |value| return value;
+            }
+        }
+    }
+
     if (self.declaredValue(wrapped, frame)) |value| {
         return value;
     }
@@ -201,14 +222,14 @@ fn axisPair(self: *const CSSStyleDeclaration, prop: *const Property) ?AxisPair {
 }
 
 fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame: *Frame) []const u8 {
-    if (!element.isVisible(frame)) {
-        return "auto";
-    }
-    const value = switch (dimension) {
-        .width => element.boxAxis(frame, .width),
-        .height => element.boxAxis(frame, .height),
-    };
-    return frame.local_arena.print("{d}px", .{value}) catch "auto";
+    const owner = element.ownerFrame(frame) orelse return "auto";
+    const box = owner.layout.box(element.asNode(), owner);
+    const sizing = owner._style_manager.cascadedProperty(element, "box-sizing") orelse "content-box";
+    const border_box = std.mem.eql(u8, sizing, "border-box");
+    const value = if (dimension == .width)
+        if (border_box) box.width else box.width - box.border_left - box.border_right - box.padding_left - box.padding_right
+    else if (border_box) box.height else box.height - box.border_top - box.border_bottom - box.padding_top - box.padding_bottom;
+    return frame.local_arena.print("{d}px", .{@max(0, value)}) catch "auto";
 }
 
 pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {

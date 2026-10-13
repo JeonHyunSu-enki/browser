@@ -346,18 +346,17 @@ pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, rej
 
     const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
-    if (no_handler) {
-        self.page.recordJsError(error.JsException);
-    }
-
     const target = self.asEventTarget();
     if (self._event_manager.hasDirectListeners(target, event_name)) {
         const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+            .cancelable = no_handler,
             .reason = if (rejection.reason()) |r| try r.persist() else null,
             .promise = try rejection.promise().persist(),
         }, self.page)).asEvent();
         try self.dispatch(target, event, .{});
+        if (event._prevent_default) return;
     }
+    if (no_handler) self.page.recordJsError(error.JsException);
 }
 
 fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void {

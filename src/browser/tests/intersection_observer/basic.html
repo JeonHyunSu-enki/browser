@@ -32,17 +32,21 @@
     });
 </script>
 
-<script id=detached>
+<script id=detached type=module>
   {
     // never attached
     let count = 0;
+    const state = await testing.async();
     const div = document.createElement('div');
     new IntersectionObserver((entries) => {
       count += 1;
+      testing.expectEqual(false, entries[0].isIntersecting);
+      testing.expectEqual(0, entries[0].intersectionRatio);
+      state.resolve();
     }).observe(div);
 
-    testing.onload(() => {
-      testing.expectEqual(0, count);
+    await state.done(() => {
+      testing.expectEqual(1, count);
     });
   }
 

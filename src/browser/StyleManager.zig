@@ -61,6 +61,7 @@ text: Group(Text) = .{},
 
 // Keyed by property name, pruning to what is (hopefully) one or few rules
 custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
+layout_rules: std.ArrayList(LayoutRule) = .empty,
 
 /// The thing to remember about layers is that we can't determine priority's
 /// layer_rank until everything is parsed. So we need to build up meta data when
@@ -85,6 +86,60 @@ dirty: bool = false,
 // The sheet that emitted the highest document order. A rule appended to it,
 // or to a later sheet, stays last in cascade order.
 last_rule_sheet: ?*CSSStyleSheet = null,
+
+pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64 };
+const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
+
+fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, layer: u16) !void {
+    const allocator = self.arena.allocator();
+    var declarations: std.ArrayList(CssParser.Declaration) = .empty;
+    var parser = CssParser.parseDeclarationsList(block);
+    while (parser.next()) |declaration| {
+        const name = try allocator.dupe(u8, declaration.name);
+        if (!std.mem.startsWith(u8, name, "--")) for (name) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        };
+        try declarations.append(allocator, .{ .name = name, .value = try allocator.dupe(u8, declaration.value), .important = declaration.important });
+    }
+    if (declarations.items.len == 0) return;
+    const priority = try self.nextPriority(layer);
+    for (SelectorParser.parseList(allocator, selectors) catch return) |selector| {
+        try self.layout_rules.append(allocator, .{ .selector = selector, .declarations = declarations.items, .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT), .important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK) | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) });
+    }
+}
+
+pub fn layoutProperties(self: *StyleManager, element: *Element, allocator: Allocator) ![]LayoutProperty {
+    try self.rebuildIfDirty();
+    var result: std.ArrayList(LayoutProperty) = .empty;
+    for (self.layout_rules.items) |rule| {
+        if (!matchesSelector(element, rule.selector, self.frame)) continue;
+        for (rule.declarations) |declaration| {
+            const priority = if (declaration.important) rule.important_priority else rule.priority;
+            try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = priority });
+        }
+    }
+    if (element.inlineStyle(self.frame)) |style| {
+        var iterator = style.asCSSStyleDeclaration().iterator();
+        while (iterator.next()) |property| {
+            try result.append(allocator, .{ .name = property._name.str(), .value = property._value.str(), .priority = if (property._important) std.math.maxInt(u64) else IMPORTANT_BIT - 1 });
+        }
+    }
+    std.mem.sort(LayoutProperty, result.items, {}, struct {
+        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
+            return a.priority < b.priority;
+        }
+    }.lessThan);
+    return result.items;
+}
+
+pub fn cascadedProperty(self: *StyleManager, element: *Element, name: []const u8) ?[]const u8 {
+    const properties = self.layoutProperties(element, self.frame.call_arena) catch return null;
+    var found: ?[]const u8 = null;
+    for (properties) |property| if (std.ascii.eqlIgnoreCase(property.name, name)) {
+        found = property.value;
+    };
+    return found;
+}
 
 pub fn init(frame: *Frame) !StyleManager {
     return .{
@@ -442,6 +497,11 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
         @field(self, field).stampRules(self);
     }
 
+    for (self.layout_rules.items) |*rule| {
+        rule.priority |= self.layerRank(rule.priority) << RANK_SHIFT;
+        rule.important_priority |= self.layerRank(rule.important_priority) << RANK_SHIFT;
+    }
+
     // Custom rules parse their selectors lazily, but the layer ranks are only
     // known now that every sheet has been read
     var custom_it = self.custom_rules.valueIterator();
@@ -472,6 +532,7 @@ fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []cons
     if (selector_text.len == 0) {
         return;
     }
+    try self.addLayoutRule(selector_text, block_text, layer);
     var customs: CustomSink = .{ .allocator = build_arena };
     const folded = try foldDeclarations(Declarations, block_text, &customs);
     _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs.map.values(), layer);
@@ -606,6 +667,7 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     }
 
     self.custom_rules = .empty;
+    self.layout_rules = .empty;
     try self.custom_rules.ensureTotalCapacity(self.arena.allocator(), custom_rules_count);
 
     const sheets = self.frame.document._style_sheets orelse return;
@@ -1072,6 +1134,12 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
         return false;
     }
     const style = style_rule._style orelse return false;
+    var text = std.Io.Writer.Allocating.init(self.frame.call_arena);
+    var declarations = style.asCSSStyleDeclaration().iterator();
+    while (declarations.next()) |property| {
+        try text.writer.print("{s}:{s}{s};", .{ property._name.str(), property._value.str(), if (property._important) " !important" else "" });
+    }
+    try self.addLayoutRule(selector_text, text.written(), NO_LAYER);
     const folded = extractDeclared(Declarations, style);
     const customs = try self.extractCustomDeclarations(style);
 

@@ -1499,12 +1499,33 @@ pub fn querySelectorAll(self: *Element, input: []const u8, frame: *Frame) !*Sele
     return Selector.querySelectorAll(self.asNode(), input, frame) catch |err| Selector.mapErrorToDOM(err);
 }
 
-pub fn getAnimations(_: *const Element) []*Animation {
-    return &.{};
+pub fn getAnimations(self: *Element, options: ?struct { subtree: bool = false }, frame: *Frame) ![]*Animation {
+    return Animation.collect(self.asNode(), if (options) |value| value.subtree else false, frame);
 }
 
-pub fn animate(_: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
+pub fn animate(self: *Element, keyframes: ?js.Object, options: ?js.Value, frame: *Frame) !*Animation {
     const animation = try Animation.init(frame);
+    if (options) |value| {
+        if (value.isNumber()) {
+            animation._duration_ms = @intFromFloat(@max(0, @min(try value.toF64(), 2147483647)));
+        } else if (value.isObject()) {
+            const object = value.toObject();
+            const duration = try object.get("duration");
+            if (duration.isNumber()) animation._duration_ms = @intFromFloat(@max(0, @min(try duration.toF64(), 2147483647)));
+            const fill = try object.get("fill");
+            if (fill.isString() != null) {
+                const text = try fill.toZig([]const u8);
+                animation._fill_forwards = std.mem.eql(u8, text, "forwards") or std.mem.eql(u8, text, "both");
+            }
+        }
+    }
+    const effect = try @import("animation/KeyframeEffect.zig").init(self, keyframes, options, frame);
+    effect.acquireRef();
+    effect._animation = animation;
+    effect._duration = @floatFromInt(animation._duration_ms);
+    effect._fill = if (animation._fill_forwards) "forwards" else "none";
+    animation._effect_native = effect;
+    try animation.attach(self, frame);
     try animation.play(frame);
     return animation;
 }
@@ -1578,37 +1599,9 @@ pub const Axis = enum {
 };
 
 pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.State {
-    const tag = self.getTag();
-    const root = self.isRootContainer();
-
-    if (self.ownerFrame(frame)) |owner| {
-        const style_manager = &owner._style_manager;
-        // Roots take only an inline size: a sheet's `height: 100vh` on body
-        // would shrink the box every synthetic position must fit in.
-        const size = if (root) style_manager.inlineSize(self, axis) else style_manager.declaredSize(self, axis);
-        if (size) |v| {
-            return .{ .value = v, .explicit = true };
-        }
-    }
-
-    // Root containers span the document, see Document.extent.
-    if (root) {
-        return .{ .value = switch (axis) {
-            .width => 1920.0,
-            .height => if (self.asNode().ownerDocument(frame)) |doc| doc.extent().height else 0.0,
-        } };
-    }
-
-    // Presentational attributes lose to CSS sizes.
-    if (tag == .img or tag == .iframe) {
-        if (self.getAttributeSafe(comptime .wrap(@tagName(axis)))) |attr| {
-            if (std.fmt.parseFloat(f64, attr)) |parsed| {
-                return .{ .value = parsed, .explicit = true };
-            } else |_| {}
-        }
-    }
-
-    return .{ .value = 5.0 };
+    const owner = self.ownerFrame(frame) orelse return .{ .value = 0 };
+    const value = owner.layout.box(self.asNode(), owner);
+    return .{ .value = if (axis == .width) value.width else value.height, .explicit = owner._style_manager.cascadedProperty(self, @tagName(axis)) != null };
 }
 
 // The document's <html>, or a <body> under it. These span the document and
@@ -1639,10 +1632,11 @@ pub fn getClientHeight(self: *Element, frame: *Frame) f64 {
 }
 
 fn clientAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
-    if (!self.isVisible(frame)) {
-        return 0.0;
-    }
-    return self.viewportAxis(frame, axis) orelse self.boxAxis(frame, axis);
+    if (!self.isVisible(frame)) return 0;
+    if (self.viewportAxis(frame, axis)) |value| return value;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const box = owner.layout.box(self.asNode(), owner);
+    return @round(@max(0, if (axis == .width) box.width - box.border_left - box.border_right else box.height - box.border_top - box.border_bottom));
 }
 
 /// Document.scrollSize, when self is the root scroller (see viewportAxis).
@@ -1671,21 +1665,13 @@ fn viewportAxis(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
 
 // Caller must have made sure self is visible.
 pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
-    const own = self.getElementAxis(frame, axis);
-    if (own.explicit) {
-        // an explicitly set value always wins
-        return own.value;
-    }
-
-    if (self.isRootContainer()) {
-        // html/body return their set value regardless of children.
-        return own.value;
-    }
-
-    return @max(own.value, self.contentAxis(frame, axis));
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const box = owner.layout.box(self.asNode(), owner);
+    return if (axis == .width) box.width else box.height;
 }
 
 pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
+    if (self.ownerFrame(frame)) |owner| try owner.layout.ensure(owner);
     return DOMRect.create(self.boundingClientRectValues(frame), frame._factory);
 }
 
@@ -1701,12 +1687,8 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
 
 // Some cases need the bounding rect but have already done the visibility check.
 pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
-    return .{
-        .x = self.horizontalPosition(frame),
-        .y = calculateDocumentPosition(self.asNode()),
-        .width = self.boxAxis(frame, .width),
-        .height = self.boxAxis(frame, .height),
-    };
+    const owner = self.ownerFrame(frame) orelse return .{};
+    return owner.layout.rect(self.asNode(), owner);
 }
 
 pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
@@ -1777,52 +1759,29 @@ pub fn containsOverscroll(self: *Element, axes: ScrollAxes, frame: *Frame) bool 
 }
 
 pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
-    if (!self.isVisible(frame)) {
-        return 0.0;
-    }
-
-    const height = self.getElementAxis(frame, .height).value;
-
-    // The root scroller reports what the viewport scrolls over.
-    if (self.isRootContainer()) {
-        return self.rootScrollSize(frame, .height) orelse height;
-    }
-
-    return @max(height, self.contentAxis(frame, .height));
+    if (!self.isVisible(frame)) return 0;
+    if (self.rootScrollSize(frame, .height)) |size| return size;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const box = owner.layout.box(self.asNode(), owner);
+    return @round(@max(box.height, box.content_height));
 }
 
 pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
-    if (!self.isVisible(frame)) {
-        return 0.0;
-    }
-
-    const width = self.getElementAxis(frame, .width).value;
-
-    // Roots don't sum their children side by side. The root scroller
-    // reports what the viewport scrolls over.
-    if (self.isRootContainer()) {
-        return self.rootScrollSize(frame, .width) orelse width;
-    }
-
-    return @max(width, self.contentAxis(frame, .width));
+    if (!self.isVisible(frame)) return 0;
+    if (self.rootScrollSize(frame, .width)) |size| return size;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const box = owner.layout.box(self.asNode(), owner);
+    return @round(@max(box.width, box.content_width));
 }
 
 /// Null where we can't prove a limit, which leaves the offset unbounded:
 /// without an explicit size the client and content measurements collapse onto
 /// the same sum. html and body scroll the viewport, clamped by Window.
 fn scrollExtent(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
-    if (self.isRootContainer() or !self.getElementAxis(frame, axis).explicit) {
-        return null;
-    }
+    if (self.isRootContainer()) return null;
     const client = self.clientAxis(frame, axis);
-    const content = switch (axis) {
-        .width => self.getScrollWidth(frame),
-        .height => self.getScrollHeight(frame),
-    };
-    if (content <= client) {
-        return null;
-    }
-    return content - client;
+    const content = if (axis == .width) self.getScrollWidth(frame) else self.getScrollHeight(frame);
+    return @max(0, content - client);
 }
 
 // One axis of the direct child elements' size: laid end to end on a single
@@ -1848,36 +1807,9 @@ fn scrollExtent(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
 // Text children add height only under an explicit width to wrap at.
 // Otherwise almost every element with text would report overflow.
 pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
-    var total: f64 = 0;
     const owner = self.ownerFrame(frame) orelse return 0;
-    const style_manager = &owner._style_manager;
-
-    var wrap: ?text_measure.LineWrap = null;
-    if (axis == .height) {
-        const width = self.getElementAxis(frame, .width);
-        if (width.explicit) {
-            wrap = .{ .line_width = width.value, .font_size = style_manager.computedFontSize(self) };
-        }
-    }
-
-    var child = self.asNode().firstChild();
-    while (child) |node| : (child = node.nextSibling()) {
-        if (node.is(Element)) |el| {
-            if (!style_manager.hasDisplayNone(el)) {
-                total += el.getElementAxis(frame, axis).value;
-            }
-        } else if (wrap) |*w| {
-            if (node.is(Node.CData.Text)) |text| {
-                w.add(text.ownData());
-            }
-        }
-    }
-
-    if (wrap) |w| {
-        // Whole pixels, like scroll offsets
-        total += @ceil(w.height());
-    }
-    return total;
+    const value = owner.layout.box(self.asNode(), owner);
+    return if (axis == .width) value.content_width else value.content_height;
 }
 
 // Unlike clientHeight, the root's offsetHeight is the document height.
@@ -1896,17 +1828,25 @@ pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
 }
 
 pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
-    if (!self.isVisible(frame)) {
-        return 0.0;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const value = owner.layout.box(self.asNode(), owner);
+    if (self.getOffsetParent(frame)) |parent| {
+        if (parent.getTag() == .body and std.mem.eql(u8, owner._style_manager.cascadedProperty(parent, "position") orelse "static", "static")) return @round(value.y);
+        const base = owner.layout.box(parent.asNode(), owner);
+        return @round(value.y - base.y - base.border_top);
     }
-    return calculateDocumentPosition(self.asNode());
+    return @round(value.y);
 }
 
 pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
-    if (!self.isVisible(frame)) {
-        return 0.0;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const value = owner.layout.box(self.asNode(), owner);
+    if (self.getOffsetParent(frame)) |parent| {
+        if (parent.getTag() == .body and std.mem.eql(u8, owner._style_manager.cascadedProperty(parent, "position") orelse "static", "static")) return @round(value.x);
+        const base = owner.layout.box(parent.asNode(), owner);
+        return @round(value.x - base.x - base.border_left);
     }
-    return self.horizontalPosition(frame);
+    return @round(value.x);
 }
 
 pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
@@ -1934,6 +1874,8 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
         }
         const ancestor = n.is(Element) orelse break;
 
+        const transform = ancestor.ownerFrame(frame).?._style_manager.cascadedProperty(ancestor, "transform") orelse "none";
+        if (!std.mem.eql(u8, transform, "none")) return ancestor;
         const tag = ancestor.getTag();
         if (tag == .body) {
             return ancestor;
@@ -1955,14 +1897,14 @@ fn positionStyle(self: *Element, frame: *Frame) []const u8 {
     return style.asCSSStyleDeclaration().getPropertyValue("position", frame);
 }
 
-pub fn getClientTop(_: *Element) f64 {
-    // Border width - in our dummy layout, we don't apply borders to layout
-    return 0.0;
+pub fn getClientTop(self: *Element, frame: *Frame) f64 {
+    const owner = self.ownerFrame(frame) orelse return 0;
+    return @round(owner.layout.box(self.asNode(), owner).border_top);
 }
 
-pub fn getClientLeft(_: *Element) f64 {
-    // Border width - in our dummy layout, we don't apply borders to layout
-    return 0.0;
+pub fn getClientLeft(self: *Element, frame: *Frame) f64 {
+    const owner = self.ownerFrame(frame) orelse return 0;
+    return @round(owner.layout.box(self.asNode(), owner).border_left);
 }
 
 // Calculates document position by counting all nodes that appear before this one
@@ -1989,73 +1931,9 @@ pub fn getClientLeft(_: *Element) f64 {
 // - Linear scaling: 5px per node
 // - Perfect document order, guaranteed unique positions
 // - Compact coordinates (1000 nodes ≈ 5,000px)
-fn calculateDocumentPosition(node: *Node) f64 {
-    var position: f64 = 0.0;
-    var current = node;
-
-    // Walk up to root, counting preceding nodes
-    while (current.parentNode()) |parent| {
-        // Count all previous siblings and their descendants
-        var sibling = parent.firstChild();
-        while (sibling) |s| {
-            if (s == current) break;
-            position += countSubtreeNodes(s);
-            sibling = s.nextSibling();
-        }
-
-        // Count the parent itself
-        position += 1.0;
-        current = parent;
-    }
-
-    return position * 5.0; // 5px per node
-}
-
-// Counts total nodes in a subtree (node + all descendants)
-fn countSubtreeNodes(node: *Node) f64 {
-    var count: f64 = 0;
-    var tw = TreeWalker.Full.init(node, .{});
-    while (tw.next()) |_| {
-        count += 1;
-    }
-    return count;
-}
-
-// The horizontal position follows the same single-row assumption as
-// contentAxis: an element sits to the right of the visible element
-// siblings before it.
-
-// translateX is commonly used to shift elements around, e.g. in a carousel to
-// shift things around. So we honor any transform: translateX inline styles.
 pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
-    var x: f64 = 0.0;
-    var current = self.asNode();
     const owner = self.ownerFrame(frame) orelse return 0;
-    const style_manager = &owner._style_manager;
-
-    if (self.inlineStyle(frame)) |style| {
-        x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
-    }
-
-    while (current.parentNode()) |parent| {
-        if (parent.is(Element)) |el| {
-            if (el.inlineStyle(frame)) |style| {
-                x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
-            }
-        }
-        var sibling = parent.firstChild();
-        while (sibling) |s| : (sibling = s.nextSibling()) {
-            if (s == current) break;
-            if (s.is(Element)) |el| {
-                if (!style_manager.hasDisplayNone(el)) {
-                    x += el.getElementAxis(frame, .width).value;
-                }
-            }
-        }
-        current = parent;
-    }
-
-    return x;
+    return owner.layout.box(self.asNode(), owner).x;
 }
 
 pub fn getElementsByTagName(self: *Element, tag_name: []const u8, frame: *Frame) !Node.GetElementsByTagNameResult {
@@ -2114,7 +1992,7 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: 
 
 pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
     _ = center_if_needed;
-    const y = calculateDocumentPosition(self.asNode());
+    const y = if (self.ownerFrame(frame)) |owner| owner.layout.box(self.asNode(), owner).y else 0;
     const scroll_y: f64 = @floatFromInt(frame.window.getScrollY());
     const viewport_height: f64 = @floatFromInt(frame.window.getInnerHeight(frame));
     if (y >= scroll_y and y <= scroll_y + viewport_height) {
@@ -2132,7 +2010,7 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) 
     // Scroll the window so the element's top is brought into the viewport.
     // Positions come from the faux-layout document position (top = preorder
     // depth-scaled y), the same source getBoundingClientRect uses.
-    const y = calculateDocumentPosition(self.asNode());
+    const y = if (self.ownerFrame(frame)) |owner| owner.layout.box(self.asNode(), owner).y else 0;
     frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
 }
 
@@ -2221,6 +2099,7 @@ fn writeScroll(self: *Element, write: ScrollWrite, frame: *Frame) !bool {
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
+    owner.page.scroll_version += 1;
     gop.value_ptr.x = x;
     gop.value_ptr.y = y;
     try self.scheduleScrollEvents(gop.value_ptr, owner);
@@ -2617,6 +2496,15 @@ pub const Tag = enum {
     }
 };
 
+fn checkedGeometry(comptime getter: anytype) type {
+    return struct {
+        fn get(self: *Element, frame: *Frame) !f64 {
+            if (self.ownerFrame(frame)) |owner| try owner.layout.ensure(owner);
+            return getter(self, frame);
+        }
+    };
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Element);
 
@@ -2837,18 +2725,18 @@ pub const JsApi = struct {
     pub const animate = bridge.function(Element.animate, .{});
     pub const checkVisibility = bridge.function(Element.checkVisibility, .{});
     pub const requestFullscreen = bridge.function(Element.requestFullscreen, .{});
-    pub const clientWidth = bridge.accessor(Element.getClientWidth, null, .{});
-    pub const clientHeight = bridge.accessor(Element.getClientHeight, null, .{});
+    pub const clientWidth = bridge.accessor(checkedGeometry(Element.getClientWidth).get, null, .{});
+    pub const clientHeight = bridge.accessor(checkedGeometry(Element.getClientHeight).get, null, .{});
     pub const clientTop = bridge.accessor(Element.getClientTop, null, .{});
     pub const clientLeft = bridge.accessor(Element.getClientLeft, null, .{});
     pub const scrollTop = bridge.accessor(Element.getScrollTop, Element.setScrollTop, .{});
     pub const scrollLeft = bridge.accessor(Element.getScrollLeft, Element.setScrollLeft, .{});
-    pub const scrollHeight = bridge.accessor(Element.getScrollHeight, null, .{});
-    pub const scrollWidth = bridge.accessor(Element.getScrollWidth, null, .{});
-    pub const offsetTop = bridge.accessor(Element.getOffsetTop, null, .{});
-    pub const offsetLeft = bridge.accessor(Element.getOffsetLeft, null, .{});
-    pub const offsetWidth = bridge.accessor(Element.getOffsetWidth, null, .{});
-    pub const offsetHeight = bridge.accessor(Element.getOffsetHeight, null, .{});
+    pub const scrollHeight = bridge.accessor(checkedGeometry(Element.getScrollHeight).get, null, .{});
+    pub const scrollWidth = bridge.accessor(checkedGeometry(Element.getScrollWidth).get, null, .{});
+    pub const offsetTop = bridge.accessor(checkedGeometry(Element.getOffsetTop).get, null, .{});
+    pub const offsetLeft = bridge.accessor(checkedGeometry(Element.getOffsetLeft).get, null, .{});
+    pub const offsetWidth = bridge.accessor(checkedGeometry(Element.getOffsetWidth).get, null, .{});
+    pub const offsetHeight = bridge.accessor(checkedGeometry(Element.getOffsetHeight).get, null, .{});
     pub const offsetParent = bridge.accessor(Element.getOffsetParent, null, .{});
     pub const getClientRects = bridge.function(Element.getClientRects, .{});
     pub const getBoundingClientRect = bridge.function(Element.getBoundingClientRect, .{});
@@ -2929,6 +2817,14 @@ test "Element: scroll extent" {
         \\<div style="height: 100px; overflow: auto"><div style="height: 500px"></div></div>
         \\<div style="height: 100px; overflow: auto">text, and no element child to measure</div>
     );
+    const html = frame.document.getDocumentElement() orelse blk: {
+        const element = try frame.document.createElement("html", null, frame);
+        try frame.appendNode(frame.document.asNode(), element.asNode(), .{ .previous_root = element.asNode().getRootNode(.{}) });
+        break :blk element;
+    };
+    const body = try frame.document.createElement("body", null, frame);
+    try frame.appendNode(html.asNode(), body.asNode(), .{ .previous_root = body.asNode().getRootNode(.{}) });
+    try frame.appendNode(body.asNode(), root.asNode(), .{ .previous_root = root.asNode().getRootNode(.{}) });
     const box = root.asNode().firstChild().?.as(Element);
     const text = box.nextElementSibling().?;
 
@@ -2937,11 +2833,9 @@ test "Element: scroll extent" {
     try box.setScrollTop(-1, frame);
     try testing.expectEqual(0, box.getScrollTop(frame));
 
-    // A real browser clamps this one too, to the height of its text. contentAxis
-    // sums element children only, so we have no extent to clamp against and the
-    // offset stays unbounded.
+    // Text that fits the box has no scrollable extent.
     try text.setScrollTop(9999, frame);
-    try testing.expectEqual(9999, text.getScrollTop(frame));
+    try testing.expectEqual(0, text.getScrollTop(frame));
 }
 
 test "Element: div chain slot size" {

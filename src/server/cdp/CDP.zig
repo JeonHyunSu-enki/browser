@@ -51,7 +51,9 @@ const InterceptState = fetch.InterceptState;
 pub const URL_BASE = "chrome://newtab/";
 
 const SessionIdGen = Incrementing(u32, "SID");
-const BrowserSessionIdGen = Incrementing(u32, "BSID");
+const BrowserSessionIdGen = Incrementing(u64, "BSID");
+const AuxiliarySessionIdGen = Incrementing(u64, "ASID");
+var client_session_sequence: std.atomic.Value(u64) = .init(0);
 const BrowserContextIdGen = Incrementing(u32, "BID");
 // webmcp tool invocation
 pub const InvocationIdGen = Incrementing(u32, "INV");
@@ -73,6 +75,7 @@ target_discover: bool = false,
 
 session_id_gen: SessionIdGen = .{},
 browser_session_id_gen: BrowserSessionIdGen = .{},
+auxiliary_session_id_gen: AuxiliarySessionIdGen = .{},
 browser_context_id_gen: BrowserContextIdGen = .{},
 
 // Session from Target.attachToBrowserTarget. Distinct from the page
@@ -342,6 +345,16 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
     }
 
     return error.UnknownDomain;
+}
+
+pub fn nextBrowserSessionId(self: *CDP) []const u8 {
+    self.browser_session_id_gen.counter = client_session_sequence.fetchAdd(1, .monotonic);
+    return self.browser_session_id_gen.next();
+}
+
+pub fn nextAuxiliarySessionId(self: *CDP) []const u8 {
+    self.auxiliary_session_id_gen.counter = client_session_sequence.fetchAdd(1, .monotonic);
+    return self.auxiliary_session_id_gen.next();
 }
 
 pub fn resolveSessionId(self: *const CDP, input_session_id: []const u8) ?[]const u8 {

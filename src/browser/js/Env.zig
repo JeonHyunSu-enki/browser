@@ -528,6 +528,9 @@ pub fn runMicrotasks(self: *Env) void {
             const ctx = self.contexts.items[i];
             const page_scope = ctx.page.logScope();
             v8.v8__MicrotaskQueue__PerformCheckpoint(ctx.microtask_queue, v8_isolate);
+            ctx.queuePromiseNotifications() catch |err| {
+                log.err(.js, "promise notification queue", .{ .err = err });
+            };
             page_scope.exit();
 
             if (self.terminatePending()) {
@@ -856,25 +859,12 @@ fn promiseRejectCallback(message_handle: v8.PromiseRejectMessage) callconv(.c) v
     ctx.call_depth += 1;
     defer ctx.call_depth -= 1;
 
-    const no_handler = promise_event == v8.kPromiseRejectWithNoHandler;
-    switch (ctx.global) {
-        .frame => |frame| {
-            frame.window.unhandledPromiseRejection(no_handler, .{
-                .local = &local,
-                .handle = &message_handle,
-            }, frame) catch |err| {
-                log.debug(.browser, "unhandled rejection handler", .{ .err = err, .target = "window" });
-            };
-        },
-        .worker => |wsg| {
-            wsg.unhandledPromiseRejection(no_handler, .{
-                .local = &local,
-                .handle = &message_handle,
-            }) catch |err| {
-                log.debug(.browser, "unhandled rejection handler", .{ .err = err, .target = "worker" });
-            };
-        },
-    }
+    ctx.recordPromiseRejection(promise_event == v8.kPromiseRejectWithNoHandler, .{
+        .local = &local,
+        .handle = &message_handle,
+    }) catch |err| {
+        log.err(.js, "promise rejection tracking", .{ .err = err });
+    };
 }
 
 // V8 reports an exception that escapes to the top without a TryCatch. We

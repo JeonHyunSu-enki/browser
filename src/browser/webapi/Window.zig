@@ -825,6 +825,7 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
         return;
     }
 
+    frame.page.scroll_version += 1;
     self._scroll_pos.x = new_x;
     self._scroll_pos.y = new_y;
     self._scroll_pos.state = .scroll;
@@ -911,18 +912,17 @@ pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.
 
     const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
-    if (no_handler) {
-        frame.page.recordJsError(error.JsException);
-    }
-
     const target = self.asEventTarget();
     if (frame._event_manager.hasDirectListeners(target, event_name)) {
         const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+            .cancelable = no_handler,
             .reason = if (rejection.reason()) |r| try r.persist() else null,
             .promise = try rejection.promise().persist(),
         }, frame.page)).asEvent();
         try frame._event_manager.dispatchDirect(target, event, .{ .context = "window.unhandledrejection" });
+        if (event._prevent_default) return;
     }
+    if (no_handler) frame.page.recordJsError(error.JsException);
 }
 
 // Some properties are readonly but [Replaceable]. They get assigned as own

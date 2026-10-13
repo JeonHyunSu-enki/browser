@@ -484,59 +484,9 @@ pub const Extent = struct { width: f64, height: f64 };
 /// size.
 pub fn extent(self: *Document) Extent {
     const frame = self._frame orelse return .{ .width = 0, .height = 0 };
-    const version = frame.page.style_version;
-    const viewport = frame.page.getViewport();
-    if (self._extent) |cached| {
-        if (cached.version == version and cached.viewport_width == viewport.width and cached.viewport_height == viewport.height) {
-            return cached.extent;
-        }
-    }
-
-    const style_manager = &frame._style_manager;
-    var size: Extent = .{ .width = 0, .height = 0 };
-
-    // A nested spacer (virtualized lists) must extend the document even when
-    // its auto-height ancestors count as 5px each. Body's own children are
-    // stacked below instead. Only inline heights: virtualizers set theirs
-    // inline, and the cascade per element is too slow on every mutation.
-    var index: f64 = 0;
-    var tw = @import("TreeWalker.zig").Full.init(self.asNode(), .{});
-    while (tw.next()) |node| : (index += 1) {
-        const el = node.is(Element) orelse continue;
-        const parent = el.parentElement() orelse continue;
-        if (parent.isRootContainer()) {
-            continue;
-        }
-        if (style_manager.inlineSize(el, .height)) |height| {
-            size.height = @max(size.height, index * 5.0 + height);
-        }
-    }
-    size.height = @max(size.height, index * 5.0);
-
-    if (self.is(HTMLDocument)) |html_doc| {
-        if (html_doc.getBody()) |html_body| {
-            const body = html_body.asElement();
-            size.height = @max(size.height, body.contentAxis(frame, .height), style_manager.inlineSize(body, .height) orelse 0);
-            size.width = style_manager.inlineSize(body, .width) orelse 0;
-            var child = body.asNode().firstChild();
-            while (child) |node| : (child = node.nextSibling()) {
-                const el = node.is(Element) orelse continue;
-                if (!style_manager.hasDisplayNone(el)) {
-                    size.width = @max(size.width, el.getElementAxis(frame, .width).value);
-                }
-            }
-        }
-    }
-
-    // Whole pixels, like scroll offsets
-    size = .{ .width = @ceil(size.width), .height = @ceil(size.height) };
-    self._extent = .{
-        .version = version,
-        .viewport_width = viewport.width,
-        .viewport_height = viewport.height,
-        .extent = size,
-    };
-    return size;
+    const root = self.getDocumentElement() orelse return .{ .width = 0, .height = 0 };
+    const box = frame.layout.box(root.asNode(), frame);
+    return .{ .width = @ceil(@max(box.width, box.content_width)), .height = @ceil(@max(box.height, box.content_height)) };
 }
 
 /// What the viewport scrolls over: the document, at least viewport-sized.
@@ -554,8 +504,8 @@ fn getSelection(self: *Document) *Selection {
     return &self._selection;
 }
 
-pub fn getAnimations(_: *const Document) []*Animation {
-    return &.{};
+pub fn getAnimations(self: *Document, frame: *Frame) ![]*Animation {
+    return Animation.collect(self.asNode(), true, frame);
 }
 
 pub fn querySelector(self: *Document, input: String, frame: *Frame) !?*Element {
@@ -961,66 +911,18 @@ pub fn elementFromVerticalPoint(self: *Document, y: f64, frame: *Frame) !?*Eleme
 }
 
 fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: *Frame) !?*Element {
-    // DFS in document order; topmost = last visited element whose rect contains (x, y).
-    //
-    // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
-    // monotonically increasing in document order. So we maintain a running
-    // preorder counter instead of calling calculateDocumentPosition per node
-    // (which itself is O(N)). Once the counter's y passes the query y, no
-    // later element can contain the point, and we can return.
-    //
-    // Hidden subtrees still count towards the index so positions agree with
-    // getBoundingClientRect; the hidden verdict just rides down the stack.
+    const owner = self._frame orelse return null;
+    owner.layout.ensure(owner) catch |err| {
+        owner.page.recordJsError(err);
+        return error.JsException;
+    };
     var topmost: ?*Element = null;
-
-    const root = self.asNode();
-    const style_manager = &(root.ownerFrame(frame) orelse return null)._style_manager;
-    const Entry = struct { node: *Node, hidden: bool };
-    var stack: std.ArrayList(Entry) = .empty;
-    try stack.append(frame.local_arena, .{ .node = root, .hidden = false });
-
-    var preorder_index: f64 = 0;
-
-    while (stack.items.len > 0) {
-        const entry = stack.pop() orelse break;
-        const node = entry.node;
-        var hidden = entry.hidden;
-        const pos = preorder_index * 5.0;
-
-        if (pos > y) {
-            // Monotonic: no later element has top <= y, so none can contain (x, y).
-            return topmost;
-        }
-
-        preorder_index += 1;
-        if (node.is(Element)) |element| {
-            hidden = hidden or style_manager.hasDisplayNone(element);
-            // Unlike display:none, a child can opt back in, so the subtree is
-            // still walked.
-            if (!hidden and style_manager.isHitTestable(element)) {
-                if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
-                    if (ignore_x) {
-                        topmost = element;
-                    } else {
-                        // only bother calculating the horiziontal position for
-                        // elements contained by the vertical band
-                        const left = element.horizontalPosition(frame);
-                        if (x >= left and x <= left + element.boxAxis(frame, .width)) {
-                            topmost = element;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add children to stack in reverse order so we process them in document order
-        var child = node.lastChild();
-        while (child) |c| {
-            try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden });
-            child = c.previousSibling();
-        }
+    var walker = @import("TreeWalker.zig").Full.Elements.init(self.asNode(), .{});
+    while (walker.next()) |element| {
+        if (!element.isVisible(frame) or !owner._style_manager.isHitTestable(element)) continue;
+        const rect = element.boundingClientRectValues(frame);
+        if (y >= rect.y and y <= rect.y + rect.height and (ignore_x or (x >= rect.x and x <= rect.x + rect.width))) topmost = element;
     }
-
     return topmost;
 }
 

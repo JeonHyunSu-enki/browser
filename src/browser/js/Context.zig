@@ -124,12 +124,26 @@ script_manager: *ScriptManagerBase,
 
 // Our macrotasks
 scheduler: Scheduler,
+promise_rejections: std.ArrayList(PendingRejection) = .empty,
+promise_notification_queued: bool = false,
 
 // Execution context for worker-compatible APIs. This provides a common
 // interface that works in both Page and Worker contexts.
 execution: Execution,
 
 unknown_properties: (if (lp.IS_DEBUG) std.StringHashMapUnmanaged(UnknownPropertyStat) else void) = if (lp.IS_DEBUG) .{} else {},
+
+const PendingRejection = struct {
+    promise: js.Value.Global,
+    reason: ?js.Value.Global,
+    notified: bool = false,
+    handled: bool = false,
+
+    fn release(self: PendingRejection) void {
+        self.promise.release();
+        if (self.reason) |reason| reason.release();
+    }
+};
 
 const ModuleEntry = struct {
     // Can be null if we're asynchronously loading the module, in
@@ -201,6 +215,7 @@ pub fn deinit(self: *Context) void {
 
     // this can release objects
     self.scheduler.deinit();
+    for (self.promise_rejections.items) |rejection| rejection.release();
 
     for (self.global_modules.items) |*global| {
         v8.v8__Global__Reset(global);
@@ -231,6 +246,73 @@ pub fn deinit(self: *Context) void {
     // purge while the context is still alive.
     env.pumpMessageLoop();
     v8.v8__MicrotaskQueue__DELETE(self.microtask_queue);
+}
+
+pub fn recordPromiseRejection(self: *Context, no_handler: bool, rejection: js.PromiseRejection) !void {
+    const promise = rejection.promise().toValue();
+    for (self.promise_rejections.items, 0..) |*pending, i| {
+        if (!pending.promise.isEqual(promise)) continue;
+        if (!no_handler) {
+            if (pending.notified) {
+                pending.handled = true;
+            } else {
+                self.promise_rejections.swapRemove(i).release();
+            }
+        }
+        return;
+    }
+    if (!no_handler) return;
+    const persisted = try promise.persist();
+    errdefer persisted.release();
+    const reason = if (rejection.reason()) |value| try value.persist() else null;
+    errdefer if (reason) |value| value.release();
+    try self.promise_rejections.append(self.arena.allocator(), .{ .promise = persisted, .reason = reason });
+}
+
+pub fn queuePromiseNotifications(self: *Context) !void {
+    if (self.promise_notification_queued) return;
+    for (self.promise_rejections.items) |pending| {
+        if (!pending.notified or pending.handled) {
+            try self.scheduler.add(self, notifyPromiseRejections, 0, .{ .name = "promise.rejections" });
+            self.promise_notification_queued = true;
+            return;
+        }
+    }
+}
+
+fn notifyPromiseRejections(raw_ctx: *anyopaque) !?u32 {
+    const self: *Context = @ptrCast(@alignCast(raw_ctx));
+    self.promise_notification_queued = false;
+    var scope: js.Local.Scope = undefined;
+    self.localScope(&scope);
+    defer scope.deinit();
+    var i: usize = 0;
+    while (i < self.promise_rejections.items.len) {
+        const pending = self.promise_rejections.items[i];
+        if (pending.notified and !pending.handled) {
+            i += 1;
+            continue;
+        }
+        const no_handler = !pending.handled;
+        if (no_handler) {
+            self.promise_rejections.items[i].notified = true;
+            i += 1;
+        } else {
+            _ = self.promise_rejections.swapRemove(i);
+        }
+        defer if (!no_handler) pending.release();
+        const promise_value = pending.promise.local(&scope.local);
+        const rejection = js.PromiseRejection{
+            .local = &scope.local,
+            .stored_promise = .{ .local = &scope.local, .handle = @ptrCast(promise_value.handle) },
+            .stored_reason = if (pending.reason) |value| value.local(&scope.local) else null,
+        };
+        switch (self.global) {
+            .frame => |frame| try frame.window.unhandledPromiseRejection(no_handler, rejection, frame),
+            .worker => |worker| try worker.unhandledPromiseRejection(no_handler, rejection),
+        }
+    }
+    return null;
 }
 
 // setOrigin is called at navigation (opaque -> real origin) and again when a

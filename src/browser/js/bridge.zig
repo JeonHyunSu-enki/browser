@@ -1259,6 +1259,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/media/TextTrackCue.zig"),
     @import("../webapi/media/VTTCue.zig"),
     @import("../webapi/animation/Animation.zig"),
+    @import("../webapi/animation/KeyframeEffect.zig"),
     @import("../webapi/EventTarget.zig"),
     @import("../webapi/Location.zig"),
     @import("../webapi/ModelContext.zig"),

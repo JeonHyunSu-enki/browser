@@ -22,17 +22,21 @@ const v8 = js.v8;
 const PromiseRejection = @This();
 
 local: *const js.Local,
-handle: *const v8.PromiseRejectMessage,
+handle: ?*const v8.PromiseRejectMessage = null,
+stored_promise: ?js.Promise = null,
+stored_reason: ?js.Value = null,
 
 pub fn promise(self: PromiseRejection) js.Promise {
+    if (self.stored_promise) |value| return value;
     return .{
         .local = self.local,
-        .handle = v8.v8__PromiseRejectMessage__GetPromise(self.handle).?,
+        .handle = v8.v8__PromiseRejectMessage__GetPromise(self.handle.?).?,
     };
 }
 
 pub fn reason(self: PromiseRejection) ?js.Value {
-    const value_handle = v8.v8__PromiseRejectMessage__GetValue(self.handle) orelse return null;
+    if (self.handle == null) return self.stored_reason;
+    const value_handle = v8.v8__PromiseRejectMessage__GetValue(self.handle.?) orelse return null;
 
     return .{
         .local = self.local,
