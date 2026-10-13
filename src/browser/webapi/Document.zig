@@ -44,6 +44,7 @@ const Selection = @import("Selection.zig");
 const Sanitizer = @import("Sanitizer.zig");
 const XPathResult = @import("XPathResult.zig");
 const XPathExpression = @import("XPathExpression.zig");
+const Animation = @import("animation/Animation.zig");
 
 pub const XMLDocument = @import("XMLDocument.zig");
 pub const HTMLDocument = @import("HTMLDocument.zig");
@@ -551,6 +552,10 @@ pub fn scrollSize(self: *Document) Extent {
 
 fn getSelection(self: *Document) *Selection {
     return &self._selection;
+}
+
+pub fn getAnimations(_: *const Document) []*Animation {
+    return &.{};
 }
 
 pub fn querySelector(self: *Document, input: String, frame: *Frame) !?*Element {
@@ -1684,6 +1689,7 @@ pub const JsApi = struct {
     pub const getElementsByTagName = bridge.function(Document.getElementsByTagName, .{});
     pub const getElementsByTagNameNS = bridge.function(Document.getElementsByTagNameNS, .{});
     pub const getSelection = bridge.function(Document.getSelection, .{});
+    pub const getAnimations = bridge.function(Document.getAnimations, .{});
     pub const getElementsByClassName = bridge.function(Document.getElementsByClassName, .{});
     pub const getElementsByName = bridge.function(Document.getElementsByName, .{});
     pub const adoptNode = bridge.function(Document.adoptNode, .{ .ce_reactions = true });
