@@ -915,6 +915,7 @@ fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
     while (self.dispatch_queue.popFirst()) |n| {
         const transfer: *Transfer = @fieldParentPtr("_queue_node", n);
         if (mode == .sync_wait and self.isGated(transfer)) {
+            transfer.notifyBufferedCdp();
             transfer._gated = true;
             self.gated_queue.append(n);
             continue;
@@ -2485,6 +2486,7 @@ pub const Transfer = struct {
 
     // Mirror this transfer's lifecycle as CDP Network.* events (serve mode).
     _notify_cdp: bool = false,
+    _cdp_buffered_notified: bool = false,
 
     // Response came from the http cache; drives the served-from-cache
     // notification at delivery.
@@ -3063,7 +3065,7 @@ pub const Transfer = struct {
             lp.metrics.http_error.incr(http.errorReason(err));
         }
 
-        if (self._notify_cdp) {
+        if (self._notify_cdp and !self._cdp_buffered_notified) {
             self.notify(.http_request_fail, &.{
                 .transfer = self,
                 .err = err,
@@ -4266,7 +4268,7 @@ pub const Transfer = struct {
                     }
                 },
                 .header => {
-                    if (transfer._notify_cdp) {
+                    if (transfer._notify_cdp and !transfer._cdp_buffered_notified) {
                         transfer.notify(.http_response_header_done, &.{
                             .transfer = transfer,
                         });
@@ -4280,7 +4282,7 @@ pub const Transfer = struct {
                 },
                 .data => |chunk| {
                     // A partial body is a prefix, not the response body.
-                    if (transfer._notify_cdp and req.partial == null) {
+                    if (transfer._notify_cdp and !transfer._cdp_buffered_notified and req.partial == null) {
                         transfer.notify(.http_response_data, &.{
                             .data = chunk,
                             .transfer = transfer,
@@ -4303,7 +4305,7 @@ pub const Transfer = struct {
                     res.stream.data_queued = false;
                     std.mem.swap(std.ArrayList(u8), &res.buffer, &res.stream.spare);
                     const chunk = res.stream.spare.items;
-                    if (transfer._notify_cdp) {
+                    if (transfer._notify_cdp and !transfer._cdp_buffered_notified) {
                         transfer.notify(.http_response_data, &.{
                             .data = chunk,
                             .transfer = transfer,
@@ -4317,7 +4319,7 @@ pub const Transfer = struct {
                 },
                 .done => {
                     terminal = true;
-                    if (transfer._notify_cdp) {
+                    if (transfer._notify_cdp and !transfer._cdp_buffered_notified) {
                         transfer.notify(.http_request_done, &.{
                             .transfer = transfer,
                             .content_length = transfer._content_length,
@@ -4347,6 +4349,32 @@ pub const Transfer = struct {
         // Mid-stream batch fully delivered; the conn is still receiving.
         transfer._events.clearRetainingCapacity();
         transfer.state = .inflight;
+    }
+
+    fn notifyBufferedCdp(self: *Transfer) void {
+        if (!self._notify_cdp or self._cdp_buffered_notified or self._events.items.len == 0) return;
+        // Transport completion must release CDP admission before a parser's
+        // blocking request allows consumer callbacks to run.
+        switch (self._events.items[self._events.items.len - 1]) {
+            .done, .err => {},
+            else => return,
+        }
+        for (self._events.items) |event| {
+            if (event == .stream_data) return;
+        }
+        for (self._events.items) |event| {
+            switch (event) {
+                .header => self.notify(.http_response_header_done, &.{ .transfer = self }),
+                .data => |chunk| if (self.req.partial == null) {
+                    self.notify(.http_response_data, &.{ .transfer = self, .data = chunk });
+                },
+                .done => self.notify(.http_request_done, &.{ .transfer = self, .content_length = self._content_length }),
+                .err => |err| self.notify(.http_request_fail, &.{ .transfer = self, .err = err,
+                    .blocked_reason = if (err == error.UrlBlocked) .inspector else null }),
+                else => {},
+            }
+        }
+        self._cdp_buffered_notified = true;
     }
 
     fn finishDelivery(self: *Transfer) void {
