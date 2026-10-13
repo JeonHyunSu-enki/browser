@@ -115,6 +115,10 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
 }
 
 pub fn run(self: *Scheduler) !void {
+    return self.runFor(500);
+}
+
+pub fn runFor(self: *Scheduler, budget_ms: u64) !void {
     const start = lp.datetime.milliTimestamp(.boot);
     var now = start;
 
@@ -144,7 +148,7 @@ pub fn run(self: *Scheduler) !void {
         }
 
         now = lp.datetime.milliTimestamp(.boot);
-        if (now - start > 500) {
+        if (now - start >= budget_ms) {
             return;
         }
     }

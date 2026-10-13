@@ -289,9 +289,13 @@ pub fn runMicrotasks(self: *Browser) void {
 }
 
 pub fn runMacrotasks(self: *Browser) !void {
+    return self.runMacrotasksFor(500);
+}
+
+pub fn runMacrotasksFor(self: *Browser, budget_ms: u64) !void {
     const env = &self.env;
 
-    try self.env.runMacrotasks();
+    try self.env.runMacrotasksFor(budget_ms);
     self.foreground_task_posted.store(false, .release);
     env.pumpMessageLoop();
 

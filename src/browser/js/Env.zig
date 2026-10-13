@@ -546,6 +546,10 @@ pub fn runMicrotasks(self: *Env) void {
 }
 
 pub fn runMacrotasks(self: *Env) !void {
+    return self.runMacrotasksFor(500);
+}
+
+pub fn runMacrotasksFor(self: *Env, budget_ms: u64) !void {
     if (self.terminatePending()) {
         return;
     }
@@ -568,7 +572,7 @@ pub fn runMacrotasks(self: *Env) !void {
         var hs: js.HandleScope = undefined;
         const entered = ctx.enter(&hs);
         defer entered.exit();
-        try ctx.scheduler.run();
+        try ctx.scheduler.runFor(budget_ms);
     }
 }
 
