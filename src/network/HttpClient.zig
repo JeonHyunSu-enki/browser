@@ -4375,8 +4375,7 @@ pub const Transfer = struct {
                     self.notify(.http_response_data, &.{ .transfer = self, .data = chunk });
                 },
                 .done => self.notify(.http_request_done, &.{ .transfer = self, .content_length = self._content_length }),
-                .err => |err| self.notify(.http_request_fail, &.{ .transfer = self, .err = err,
-                    .blocked_reason = if (err == error.UrlBlocked) .inspector else null }),
+                .err => |err| self.notify(.http_request_fail, &.{ .transfer = self, .err = err, .blocked_reason = if (err == error.UrlBlocked) .inspector else null }),
                 else => {},
             }
         }
