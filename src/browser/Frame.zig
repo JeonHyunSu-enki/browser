@@ -201,6 +201,9 @@ _custom_element_creation: union(enum) {
 // List of custom elements that were created before their definition was registered
 _undefined_custom_elements: std.ArrayList(*Element.Html.Custom) = .empty,
 
+// Every form-associated custom element in this frame (usually none)
+_form_associated: std.ArrayList(*Element.Html.Custom) = .empty,
+
 // Pending custom-element reactions (connected/disconnected/adopted/attribute
 // changed). Reactions are enqueued during DOM mutation and drained at the
 // outer algorithm boundary — set up by the JS bridge for [CEReactions]
@@ -2884,6 +2887,11 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 
     child._parent = null;
 
+    // deferred: the id maps are only updated further down
+    defer if (self._form_associated.items.len != 0) {
+        Element.Html.Custom.formTreeChanged(parent, child, self);
+    };
+
     Element.Html.Select.childRemoved(parent, child);
     Element.Html.Picture.childRemoved(parent, child, next_sibling, self);
 
@@ -3134,6 +3142,11 @@ fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, 
     }
     child._parent = parent;
 
+    // deferred: the id maps are only updated further down.
+    defer if (self._form_associated.items.len != 0) {
+        Element.Html.Custom.formTreeChanged(parent, child, self);
+    };
+
     Element.Html.Select.childInserted(parent, child);
     if (child.is(Element.Html.Image)) |img| {
         // noop if it didn't actually change
@@ -3294,6 +3307,9 @@ pub fn attributeChange(self: *Frame, element: *Element, name: String, value: Str
     };
 
     Element.Html.Custom.enqueueAttributeChangedCallbackOnElement(element, name, old_value, value, null, self);
+    if (self._form_associated.items.len != 0) {
+        Element.Html.Custom.formAttributeChanged(element, name, self);
+    }
 
     observers.notifyAttributeChange(self, element, name, old_value);
 
@@ -3330,6 +3346,9 @@ pub fn attributeRemove(self: *Frame, element: *Element, name: String, old_value:
     };
 
     Element.Html.Custom.enqueueAttributeChangedCallbackOnElement(element, name, old_value, null, null, self);
+    if (self._form_associated.items.len != 0) {
+        Element.Html.Custom.formAttributeChanged(element, name, self);
+    }
 
     observers.notifyAttributeChange(self, element, name, old_value);
 
