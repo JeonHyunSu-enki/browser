@@ -882,6 +882,12 @@ fn clampToDelayed(self: *const Client, timeout_ms: u32) u32 {
 // `dispatchCompleted` doesn't keep checking the same gated transfers over and
 // over.
 fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
+    var gated = self.gated_queue.first;
+    while (gated) |node| {
+        gated = node.next;
+        const transfer: *Transfer = @fieldParentPtr("_queue_node", node);
+        transfer.notifyBufferedCdp();
+    }
     if (mode == .all) {
         if (comptime lp.IS_DEBUG) {
             // .all never inside a syncRequest, so nothing can be gating requests.
