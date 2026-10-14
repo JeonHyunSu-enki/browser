@@ -273,7 +273,7 @@ impl Tree {
                 if input.run_mode == taffy::RunMode::PerformLayout {
                     let text = tree.nodes[index].text.as_ref().unwrap();
                     if let Some(layout) = &text.shaped {
-                        let rects = super::inline::rectangles(layout, &text.spans);
+                        let rects = super::inline::rectangles(layout, &text.spans, &text.text);
                         tree.assign_inline(id, rects);
                     }
                 }

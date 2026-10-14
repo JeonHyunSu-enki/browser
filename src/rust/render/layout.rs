@@ -641,7 +641,8 @@ pub unsafe extern "C" fn lp_dom_layout(
                 x = position.x;
                 y = position.y;
             }
-            let q = |v: f32| (v * 64.0).floor() / 64.0;
+            let inline = matches!(inputs[index].display, 4 | 5);
+            let q = |v: f32| if inline {(v * 64.0).round() / 64.0} else {(v * 64.0).floor() / 64.0};
             outputs[index] = Output {
                 x: q(x),
                 y: q(y),

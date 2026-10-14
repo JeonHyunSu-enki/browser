@@ -80,11 +80,11 @@
 }
 </script>
 
-<script id=matchMedia_unsupported_feature>
+<script id=matchMedia_desktop_features>
 {
-  // Unknown features evaluate to false per Media Queries Level 4.
+  // Desktop media preferences match the configured viewport.
   testing.expectEqual(false, window.matchMedia('(prefers-color-scheme: dark)').matches);
-  testing.expectEqual(false, window.matchMedia('(hover: hover)').matches);
+  testing.expectEqual(true, window.matchMedia('(hover: hover)').matches);
 }
 </script>
 

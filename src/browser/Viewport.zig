@@ -25,6 +25,12 @@ scale: f32 = 1.0, // CSS px to device px
 screen_width: ?u32 = null,
 screen_height: ?u32 = null,
 orientation: ?Orientation = null,
+color_scheme: enum { light, dark, no_preference } = .light,
+reduced_motion: bool = false,
+forced_colors: bool = false,
+hover: bool = true,
+pointer: enum { none, fine, coarse } = .fine,
+media_type: enum { screen, print } = .screen,
 
 pub const Orientation = struct {
     type: Type,

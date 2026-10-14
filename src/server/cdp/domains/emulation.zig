@@ -59,16 +59,22 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }
 }
 
-// TODO: noop method
 fn setEmulatedMedia(cmd: *CDP.Command) !void {
-    // const input = (try const incoming.params(struct {
-    //     media: ?[]const u8 = null,
-    //     features: ?[]struct{
-    //         name: []const u8,
-    //         value: [] const u8
-    //     } = null,
-    // })) orelse return error.InvalidParams;
-
+    const params = (try cmd.params(struct {
+        media: ?[]const u8 = null,
+        features: ?[]struct { name: []const u8, value: []const u8 } = null,
+    })) orelse return error.InvalidParams;
+    var viewport = cmd.cdp.browser.getViewport();
+    if (params.media) |media| viewport.media_type = if (std.mem.eql(u8, media, "print")) .print else .screen;
+    viewport.color_scheme = .light;
+    viewport.reduced_motion = false;
+    viewport.forced_colors = false;
+    for (params.features orelse &.{}) |feature| {
+        if (std.mem.eql(u8, feature.name, "prefers-color-scheme")) viewport.color_scheme = if (std.mem.eql(u8, feature.value, "dark")) .dark else .light;
+        if (std.mem.eql(u8, feature.name, "prefers-reduced-motion")) viewport.reduced_motion = std.mem.eql(u8, feature.value, "reduce");
+        if (std.mem.eql(u8, feature.name, "forced-colors")) viewport.forced_colors = std.mem.eql(u8, feature.value, "active");
+    }
+    cmd.cdp.browser.setViewportOverride(viewport);
     return cmd.sendResult(null, .{});
 }
 
@@ -123,6 +129,12 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
         .scale = if (dsf > 0) dsf else current.scale,
         .screen_width = if (params.screenWidth orelse 0 > 0) params.screenWidth else current.screen_width,
         .screen_height = if (params.screenHeight orelse 0 > 0) params.screenHeight else current.screen_height,
+        .color_scheme = current.color_scheme,
+        .reduced_motion = current.reduced_motion,
+        .forced_colors = current.forced_colors,
+        .hover = current.hover,
+        .pointer = current.pointer,
+        .media_type = current.media_type,
     });
 
     return cmd.sendResult(null, .{});

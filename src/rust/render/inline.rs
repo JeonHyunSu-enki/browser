@@ -152,7 +152,7 @@ pub fn append(text: &mut String, value: &str) {
     }
 }
 
-pub fn rectangles(layout: &Layout<Rgb>, spans: &[Span]) -> Vec<(usize, taffy::Layout)> {
+pub fn rectangles(layout: &Layout<Rgb>, spans: &[Span], text: &str) -> Vec<(usize, taffy::Layout)> {
     let mut rects = std::collections::HashMap::<usize, (f32, f32, f32, f32)>::new();
     let mut ordered: Vec<_> = spans.iter().collect();
     ordered.sort_by_key(|span| span.range.start);
@@ -165,6 +165,11 @@ pub fn rectangles(layout: &Layout<Rgb>, spans: &[Span]) -> Vec<(usize, taffy::La
             for cluster in run.visual_clusters() {
                 let range = cluster.text_range();
                 let width = cluster.advance();
+                let visible_advance = line.metrics().advance - line.metrics().trailing_whitespace;
+                if text[range.clone()].bytes().all(|c|c.is_ascii_whitespace()) && x >= visible_advance {
+                    x += width;
+                    continue;
+                }
                 let start = ordered.partition_point(|span| span.range.end <= range.start);
                 for span in ordered[start..]
                     .iter()

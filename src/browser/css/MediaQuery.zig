@@ -226,8 +226,10 @@ fn matchesSingle(query: []const u8, viewport: Viewport) bool {
 
     const type_matches = if (type_set) |t|
         switch (t) {
-            .all, .screen => true,
-            .print, .speech, .tv => false,
+            .all => true,
+            .screen => viewport.media_type == .screen,
+            .print => viewport.media_type == .print,
+            .speech, .tv => false,
         }
     else
         true;
@@ -274,7 +276,7 @@ fn evalFeature(text: []const u8, viewport: Viewport) bool {
     return evalBoolean(trimmed, viewport);
 }
 
-const max_feature_name_len = 17;
+const max_feature_name_len = 32;
 
 /// Map the deprecated `device-*` features onto their viewport counterparts.
 /// `device-width` is the width of the output device; we have no separate
@@ -297,6 +299,36 @@ fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
 
     var buf: [max_feature_name_len]u8 = undefined;
     const lname = stripDevice(std.ascii.lowerString(&buf, name));
+    if (std.mem.eql(u8, lname, "hover") or std.mem.eql(u8, lname, "any-hover")) return std.ascii.eqlIgnoreCase(value, if (viewport.hover) "hover" else "none");
+    if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) return std.ascii.eqlIgnoreCase(value, @tagName(viewport.pointer));
+    if (std.mem.eql(u8, lname, "prefers-color-scheme")) return std.ascii.eqlIgnoreCase(value, if (viewport.color_scheme == .dark) "dark" else "light");
+    if (std.mem.eql(u8, lname, "prefers-reduced-motion")) return std.ascii.eqlIgnoreCase(value, if (viewport.reduced_motion) "reduce" else "no-preference");
+    if (std.mem.eql(u8, lname, "forced-colors")) return std.ascii.eqlIgnoreCase(value, if (viewport.forced_colors) "active" else "none");
+    var numeric_name = lname;
+    const comparison: enum { equal, minimum, maximum } = if (std.mem.startsWith(u8, lname, "min-")) .minimum else if (std.mem.startsWith(u8, lname, "max-")) .maximum else .equal;
+    if (comparison != .equal) numeric_name = lname[4..];
+    const actual: ?f64 = if (std.mem.eql(u8, numeric_name, "color")) 8 else if (std.mem.eql(u8, numeric_name, "color-index") or std.mem.eql(u8, numeric_name, "monochrome")) 0 else if (std.mem.eql(u8, numeric_name, "resolution")) viewport.scale else null;
+    if (actual) |number| {
+        var raw = value;
+        var factor: f64 = 1;
+        if (std.mem.eql(u8, numeric_name, "resolution")) {
+            if (std.ascii.endsWithIgnoreCase(raw, "dppx")) raw = raw[0 .. raw.len - 4] else if (std.ascii.endsWithIgnoreCase(raw, "dpi")) {
+                raw = raw[0 .. raw.len - 3];
+                factor = 1.0 / 96.0;
+            } else if (std.ascii.endsWithIgnoreCase(raw, "dpcm")) {
+                raw = raw[0 .. raw.len - 4];
+                factor = 2.54 / 96.0;
+            } else return false;
+        }
+        const requested = (std.fmt.parseFloat(f64, raw) catch return false) * factor;
+        if (!std.math.isFinite(requested) or requested < 0) return false;
+        if (!std.mem.eql(u8, numeric_name, "resolution") and requested != @floor(requested)) return false;
+        return switch (comparison) {
+            .equal => number == requested,
+            .minimum => number >= requested,
+            .maximum => number <= requested,
+        };
+    }
     if (std.mem.eql(u8, lname, "min-width")) {
         const px = parseLengthPx(value) orelse return false;
         return viewport.width >= px;
@@ -336,6 +368,12 @@ fn evalBoolean(name: []const u8, viewport: Viewport) bool {
     var buf: [max_feature_name_len]u8 = undefined;
     const lname = stripDevice(std.ascii.lowerString(&buf, name));
 
+    if (std.mem.eql(u8, lname, "color") or std.mem.eql(u8, lname, "resolution")) return true;
+    if (std.mem.eql(u8, lname, "hover") or std.mem.eql(u8, lname, "any-hover")) return viewport.hover;
+    if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) return viewport.pointer != .none;
+    if (std.mem.eql(u8, lname, "prefers-reduced-motion")) return viewport.reduced_motion;
+    if (std.mem.eql(u8, lname, "forced-colors")) return viewport.forced_colors;
+    if (std.mem.eql(u8, lname, "prefers-color-scheme")) return true;
     if (std.mem.eql(u8, lname, "width")) return viewport.width > 0;
     if (std.mem.eql(u8, lname, "height")) return viewport.height > 0;
     if (std.mem.eql(u8, lname, "orientation")) return true;
@@ -533,8 +571,8 @@ test "MediaQuery: unknown feature is false" {
     try testing.expect(!matches("(monochrome)", v));
     try testing.expect(!matches("(prefers-color-scheme: dark)", v));
     try testing.expect(!matches("(prefers-reduced-motion: reduce)", v));
-    try testing.expect(!matches("(hover: hover)", v));
-    try testing.expect(!matches("(color)", v));
+    try testing.expect(matches("(hover: hover)", v));
+    try testing.expect(matches("(color)", v));
 }
 
 test "MediaQuery: malformed value is false" {
@@ -551,7 +589,7 @@ test "MediaQuery: boolean form (feature presence)" {
     try testing.expect(matches("(height)", v));
     try testing.expect(matches("(orientation)", v));
     try testing.expect(!matches("(monochrome)", v));
-    try testing.expect(!matches("(color)", v));
+    try testing.expect(matches("(color)", v));
 }
 
 test "MediaQuery: viewport-default values" {
