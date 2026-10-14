@@ -68,6 +68,7 @@ layout_class_rules: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
 layout_tag_rules: std.AutoHashMapUnmanaged(Tag, std.ArrayList(u32)) = .empty,
 layout_other_rules: std.ArrayList(u32) = .empty,
 layout_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
+geometry_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
 layout_memo_arena: ?*lp.Arena = null,
 layout_memo_version: usize = std.math.maxInt(usize),
 font_size_memo: std.AutoHashMapUnmanaged(*Element, f64) = .empty,
@@ -97,7 +98,24 @@ dirty: bool = false,
 last_rule_sheet: ?*CSSStyleSheet = null,
 
 pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64, order: usize = 0 };
-const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
+const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, geometry_declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
+
+fn layoutRelevant(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "--")) return true;
+    const properties = std.StaticStringMap(void).initComptime(.{
+        .{ "display", {} },      .{ "position", {} },    .{ "box-sizing", {} },   .{ "width", {} },       .{ "height", {} },
+        .{ "top", {} },          .{ "right", {} },       .{ "bottom", {} },       .{ "left", {} },        .{ "gap", {} },
+        .{ "row-gap", {} },      .{ "column-gap", {} },  .{ "aspect-ratio", {} }, .{ "transform", {} },   .{ "transform-origin", {} },
+        .{ "float", {} },        .{ "clear", {} },       .{ "all", {} },          .{ "line-height", {} }, .{ "letter-spacing", {} },
+        .{ "word-spacing", {} }, .{ "white-space", {} }, .{ "text-align", {} },   .{ "text-indent", {} }, .{ "direction", {} },
+        .{ "writing-mode", {} },
+    });
+    if (properties.has(name)) return true;
+    inline for (.{ "min-", "max-", "margin", "padding", "border", "font", "flex", "grid", "align-", "justify-", "overflow" }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return true;
+    }
+    return false;
+}
 
 fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, layer: u16) !void {
     const allocator = self.arena.allocator();
@@ -112,9 +130,11 @@ fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, 
         try declarations.append(allocator, .{ .name = name, .value = try allocator.dupe(u8, declaration.value), .important = declaration.important });
     }
     if (declarations.items.len == 0) return;
+    var geometry_declarations: std.ArrayList(CssParser.Declaration) = .empty;
+    for (declarations.items) |declaration| if (layoutRelevant(declaration.name)) try geometry_declarations.append(allocator, declaration);
     const priority = try self.nextPriority(layer);
     for (SelectorParser.parseList(allocator, selectors) catch return) |selector| {
-        try self.layout_rules.append(allocator, .{ .selector = selector, .declarations = declarations.items, .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT), .important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK) | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) });
+        try self.layout_rules.append(allocator, .{ .selector = selector, .declarations = declarations.items, .geometry_declarations = geometry_declarations.items, .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT), .important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK) | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) });
         const index: u32 = @intCast(self.layout_rules.items.len - 1);
         const key = getBucketKey(selector.rightmost()) orelse .other;
         const bucket: *std.ArrayList(u32) = switch (key) {
@@ -128,32 +148,43 @@ fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, 
 }
 
 pub fn layoutProperties(self: *StyleManager, element: *Element, _: Allocator) ![]LayoutProperty {
+    return self.collectProperties(element, false);
+}
+
+pub fn geometryProperties(self: *StyleManager, element: *Element, _: Allocator) ![]LayoutProperty {
+    return self.collectProperties(element, true);
+}
+
+fn collectProperties(self: *StyleManager, element: *Element, geometry_only: bool) ![]LayoutProperty {
     try self.rebuildIfDirty();
     const memo_arena = self.layout_memo_arena orelse try self.frame.getArena(.medium, "Layout styles");
     self.layout_memo_arena = memo_arena;
     if (self.layout_memo_version != self.frame.page.style_version) {
         memo_arena.resetRetain();
         self.layout_memo = .empty;
+        self.geometry_memo = .empty;
         self.font_size_memo = .empty;
         self.layout_memo_version = self.frame.page.style_version;
     }
-    if (self.layout_memo.get(element)) |properties| return properties;
+    const memo = if (geometry_only) &self.geometry_memo else &self.layout_memo;
+    if (memo.get(element)) |cached| return cached;
     const allocator = memo_arena.allocator();
     var result: std.ArrayList(LayoutProperty) = .empty;
     if (element.getId()) |id| {
-        if (self.layout_id_rules.get(id)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
+        if (self.layout_id_rules.get(id)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
     }
     if (element.getClassName()) |classes| {
         var tokens = std.mem.tokenizeAny(u8, classes, &std.ascii.whitespace);
         while (tokens.next()) |class| {
-            if (self.layout_class_rules.get(class)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
+            if (self.layout_class_rules.get(class)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
         }
     }
-    if (self.layout_tag_rules.get(element.getTag())) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
-    try self.collectLayoutRules(element, self.layout_other_rules.items, &result, allocator);
+    if (self.layout_tag_rules.get(element.getTag())) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
+    try self.collectLayoutRules(element, self.layout_other_rules.items, &result, allocator, geometry_only);
     if (element.inlineStyle(self.frame)) |style| {
         var iterator = style.asCSSStyleDeclaration().iterator();
         while (iterator.next()) |property| {
+            if (geometry_only and !layoutRelevant(property._name.str())) continue;
             try result.append(allocator, .{ .name = property._name.str(), .value = property._value.str(), .priority = if (property._important) std.math.maxInt(u64) else IMPORTANT_BIT - 1 });
         }
     }
@@ -178,15 +209,17 @@ pub fn layoutProperties(self: *StyleManager, element: *Element, _: Allocator) ![
             return if (a.priority == b.priority) a.order < b.order else a.priority < b.priority;
         }
     }.lessThan);
-    try self.layout_memo.put(allocator, element, resolved.items);
+    try memo.put(allocator, element, resolved.items);
     return resolved.items;
 }
 
-fn collectLayoutRules(self: *StyleManager, element: *Element, indices: []const u32, result: *std.ArrayList(LayoutProperty), allocator: Allocator) !void {
+fn collectLayoutRules(self: *StyleManager, element: *Element, indices: []const u32, result: *std.ArrayList(LayoutProperty), allocator: Allocator, geometry_only: bool) !void {
     for (indices) |index| {
         const rule = self.layout_rules.items[index];
+        const declarations = if (geometry_only) rule.geometry_declarations else rule.declarations;
+        if (declarations.len == 0) continue;
         if (!matchesSelector(element, rule.selector, self.frame)) continue;
-        for (rule.declarations) |declaration| {
+        for (declarations) |declaration| {
             const priority = if (declaration.important) rule.important_priority else rule.priority;
             try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = priority });
         }
@@ -194,7 +227,7 @@ fn collectLayoutRules(self: *StyleManager, element: *Element, indices: []const u
 }
 
 pub fn cascadedProperty(self: *StyleManager, element: *Element, name: []const u8) ?[]const u8 {
-    const properties = self.layoutProperties(element, self.frame.call_arena) catch return null;
+    const properties = (if (layoutRelevant(name)) self.geometryProperties(element, self.frame.call_arena) else self.layoutProperties(element, self.frame.call_arena)) catch return null;
     var found: ?[]const u8 = null;
     for (properties) |property| if (std.ascii.eqlIgnoreCase(property.name, name)) {
         found = property.value;
@@ -1985,7 +2018,7 @@ fn importantRuleWins(self: *StyleManager, el: *Element, name: []const u8, value:
 
 /// Returns the winning declaration before variable substitution.
 pub fn rawLayoutProperty(self: *StyleManager, element: *Element, name: []const u8) !?[]const u8 {
-    for (try self.layoutProperties(element, self.frame.call_arena)) |property| {
+    for (try self.geometryProperties(element, self.frame.call_arena)) |property| {
         if (std.mem.eql(u8, property.name, name)) return property.value;
     }
     return null;
@@ -2056,7 +2089,7 @@ fn computedFontSizeAt(self: *StyleManager, element: ?*Element, depth: u8) f64 {
         return DEFAULT_FONT_SIZE;
     }
     const current = element orelse return DEFAULT_FONT_SIZE;
-    _ = self.layoutProperties(current, self.frame.call_arena) catch return DEFAULT_FONT_SIZE;
+    _ = self.geometryProperties(current, self.frame.call_arena) catch return DEFAULT_FONT_SIZE;
     if (self.font_size_memo.get(current)) |size| return size;
     const size = self.calculateFontSize(current, depth);
     self.font_size_memo.put(self.layout_memo_arena.?.allocator(), current, size) catch {};
@@ -2068,7 +2101,7 @@ fn calculateFontSize(self: *StyleManager, current: *Element, depth: u8) f64 {
 
     var declared_size: ?[]const u8 = null;
     var shorthand = false;
-    for (self.layoutProperties(current, self.frame.call_arena) catch &.{}) |property| {
+    for (self.geometryProperties(current, self.frame.call_arena) catch &.{}) |property| {
         if (std.mem.eql(u8, property.name, "font-size") or std.mem.eql(u8, property.name, "font")) {
             declared_size = property.value;
             shorthand = std.mem.eql(u8, property.name, "font");

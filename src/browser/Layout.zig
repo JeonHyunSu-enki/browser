@@ -119,7 +119,7 @@ pub fn ensure(self: *Layout, frame: *Frame) !void {
                 else => {},
             }
             if (element.getTag() == .body) try properties.append(allocator, property("margin", "8px"));
-            for (try frame._style_manager.layoutProperties(element, allocator)) |item| {
+            for (try frame._style_manager.geometryProperties(element, allocator)) |item| {
                 const resolved = try frame._style_manager.resolveProperty(element, item.value, allocator) orelse continue;
                 try properties.append(allocator, property(item.name, resolved));
             }
