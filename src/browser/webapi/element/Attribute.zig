@@ -271,7 +271,7 @@ pub const List = struct {
             };
             try owner.addElementId(parent, element, entry.value());
         }
-        owner.attributeDomChanged(result.normalized);
+        owner.attributeDomChanged(result.normalized, old_value, .wrap(entry.value()));
         owner.attributeChange(element, result.normalized, .wrap(entry.value()), old_value);
         return name;
     }
@@ -383,7 +383,7 @@ pub const List = struct {
         std.mem.copyForwards(Entry, list_entries[index .. list_entries.len - 1], list_entries[index + 1 ..]);
         self._len -= 1;
 
-        owner.attributeDomChanged(normalized);
+        owner.attributeDomChanged(normalized, .wrap(old_value), null);
         owner.attributeRemove(element, normalized, .wrap(old_value));
     }
 

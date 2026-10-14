@@ -223,6 +223,10 @@ fn tick(self: *const Driver) !bool {
         return false;
     }
 
+    // Respond to queued commands before timers can start another costly callback.
+    try self.browser.http_client.drainCommands();
+    if (self.browser.env.terminatePending()) return true;
+
     // Liveness is enforced by TCP keepalive configured in
     // Server.configureSocket; the wakeup lets V8 run or terminate.
     const wait_ms: u32 = 1000; // 1s

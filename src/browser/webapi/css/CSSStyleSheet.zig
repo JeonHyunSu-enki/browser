@@ -48,6 +48,13 @@ fn ownerStyleManager(self: *const CSSStyleSheet, frame: *Frame) ?*StyleManager {
     return &(owner.ownerFrame(frame) orelse return null)._style_manager;
 }
 
+pub fn ruleChanged(self: *CSSStyleSheet, frame: *Frame) void {
+    if (self.ownerStyleManager(frame)) |manager| {
+        manager.sheetModified();
+        manager.frame.renderingChanged();
+    }
+}
+
 pub fn getHref(self: *const CSSStyleSheet) ?[]const u8 {
     return self._href;
 }
@@ -121,6 +128,7 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
         log.debug(.not_implemented, "insertRule clamped index", .{});
     }
     try rules.insert(index, inserted, frame);
+    if (inserted.is(CSSStyleRule)) |inserted_style| inserted_style.attachSheet(self);
     if (self.ownerStyleManager(frame)) |style_manager| {
         style_manager.ruleInserted(self, inserted);
     }
@@ -201,6 +209,7 @@ fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!voi
         };
 
         try rules.insert(index, inserted, frame);
+        if (inserted.is(CSSStyleRule)) |inserted_style| inserted_style.attachSheet(self);
         index += 1;
     }
 }

@@ -24,6 +24,7 @@ const CssParser = @import("../../css/Parser.zig");
 const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
+const CSSStyleSheet = @import("CSSStyleSheet.zig");
 
 const log = lp.log;
 const String = lp.String;
@@ -32,6 +33,7 @@ const Allocator = std.mem.Allocator;
 const CSSStyleDeclaration = @This();
 
 _element: ?*Element = null,
+_sheet: ?*CSSStyleSheet = null,
 _properties: std.DoublyLinkedList = .{},
 _is_computed: bool = false,
 _syncing: bool = false,
@@ -382,6 +384,10 @@ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, fra
 // Serialize current properties back to the element's style attribute so that
 // DOM serialization (outerHTML, getAttribute) reflects JS-modified styles.
 fn syncStyleAttribute(self: *CSSStyleDeclaration, frame: *Frame) !void {
+    if (self._sheet) |sheet| {
+        sheet.ruleChanged(frame);
+        return;
+    }
     const element = self._element orelse return;
     const css_text = try self.getCssText(frame);
     self._syncing = true;

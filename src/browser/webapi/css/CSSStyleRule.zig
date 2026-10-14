@@ -2,6 +2,7 @@ const std = @import("std");
 const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const CSSRule = @import("CSSRule.zig");
+const CSSStyleSheet = @import("CSSStyleSheet.zig");
 const CSSStyleProperties = @import("CSSStyleProperties.zig");
 
 const CSSStyleRule = @This();
@@ -11,6 +12,7 @@ pub const Proto = CSSRule;
 _proto: *CSSRule,
 _selector_text: []const u8 = "",
 _style: ?*CSSStyleProperties = null,
+_sheet: ?*CSSStyleSheet = null,
 
 pub fn init(frame: *Frame) !*CSSStyleRule {
     const style_rule = try frame._factory.chained(.{
@@ -27,6 +29,7 @@ fn getSelectorText(self: *const CSSStyleRule) []const u8 {
 
 pub fn setSelectorText(self: *CSSStyleRule, text: []const u8, frame: *Frame) !void {
     self._selector_text = try frame.dupeString(text);
+    if (self._sheet) |sheet| sheet.ruleChanged(frame);
 }
 
 pub fn getStyle(self: *CSSStyleRule, frame: *Frame) !*CSSStyleProperties {
@@ -35,7 +38,13 @@ pub fn getStyle(self: *CSSStyleRule, frame: *Frame) !*CSSStyleProperties {
     }
     const style = try CSSStyleProperties.init(null, false, frame);
     self._style = style;
+    style.asCSSStyleDeclaration()._sheet = self._sheet;
     return style;
+}
+
+pub fn attachSheet(self: *CSSStyleRule, sheet: *CSSStyleSheet) void {
+    self._sheet = sheet;
+    if (self._style) |style| style.asCSSStyleDeclaration()._sheet = sheet;
 }
 
 pub fn getCssText(self: *CSSStyleRule, frame: *Frame) ![]const u8 {

@@ -75,6 +75,8 @@ dom_version: usize = 0,
 // Frame.styleChanged); validates the StyleManager memo.
 style_version: usize = 0,
 selector_version: usize = 0,
+layout_version: usize = 0,
+visibility_version: usize = 0,
 scroll_version: usize = 0,
 
 // Monotonic creation counter for BroadcastChannels in this Page. A postMessage

@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const Utf8Body = @import("../Utf8Body.zig");
 const lp = @import("lightpanda");
 
 const id = @import("../id.zig");
@@ -370,7 +371,7 @@ fn getResponseBody(cmd: *CDP.Command) !void {
     // still send invalid bytes.
     if (!resp.must_encode and std.unicode.utf8ValidateSlice(data.items)) {
         return cmd.sendResult(.{
-            .body = data.items,
+            .body = Utf8Body{ .bytes = data.items },
             .base64Encoded = false,
         }, .{ .size_hint = data.items.len });
     }

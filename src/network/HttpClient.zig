@@ -1609,6 +1609,12 @@ fn makeRequest(self: *Client, conn: *http.Connection, transfer: *Transfer) anyer
     _ = try self.handles.perform();
 }
 
+// Called only at the outer worker loop, where no JS or page references are held.
+pub fn drainCommands(self: *Client) !void {
+    if (self.disconnected) return error.ClientDisconnected;
+    return self.drainInbox(.all);
+}
+
 pub fn drainTerminal(self: *Client) !void {
     return self.drainInbox(.terminal);
 }

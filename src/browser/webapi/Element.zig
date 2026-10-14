@@ -1682,8 +1682,9 @@ pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
 }
 
 pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
+    if (!self.isVisible(frame)) return DOMRect.create(.{}, frame._factory);
     if (self.ownerFrame(frame)) |owner| try owner.layout.ensure(owner);
-    return DOMRect.create(self.boundingClientRectValues(frame), frame._factory);
+    return DOMRect.create(self.boundingClientRectValuesForVisible(frame), frame._factory);
 }
 
 // Plain rect values, no JS-backed allocation: the internal fast path shared by

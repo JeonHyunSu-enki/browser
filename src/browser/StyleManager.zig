@@ -102,7 +102,7 @@ dirty: bool = false,
 // or to a later sheet, stays last in cascade order.
 last_rule_sheet: ?*CSSStyleSheet = null,
 
-const MatchedRules = struct { geometry: ?[]u32 = null, full: ?[]u32 = null };
+const MatchedRules = struct { geometry: ?[]u32 = null, full: ?[]u32 = null, geometry_properties: ?[]LayoutProperty = null, full_properties: ?[]LayoutProperty = null };
 pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64, order: usize = 0 };
 const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, geometry_declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
 
@@ -121,6 +121,43 @@ fn layoutRelevant(name: []const u8) bool {
         if (std.mem.startsWith(u8, name, prefix)) return true;
     }
     return false;
+}
+
+// Paint-only inline changes cannot resize the tree when no selector reads style.
+pub fn sameLayoutDeclarations(old: []const u8, new: []const u8) bool {
+    return sameDeclarations(old, new, layoutRelevant);
+}
+
+pub fn sameVisibilityDeclarations(old: []const u8, new: []const u8) bool {
+    return sameDeclarations(old, new, visibilityRelevant);
+}
+
+fn visibilityRelevant(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "--")) return true;
+    return std.mem.eql(u8, name, "all") or std.mem.eql(u8, name, "display") or
+        std.mem.eql(u8, name, "visibility") or std.mem.eql(u8, name, "opacity") or std.mem.eql(u8, name, "pointer-events");
+}
+
+fn sameDeclarations(old: []const u8, new: []const u8, comptime relevant: fn ([]const u8) bool) bool {
+    var left = CssParser.parseDeclarationsList(old);
+    var right = CssParser.parseDeclarationsList(new);
+    while (true) {
+        const a = nextRelevantDeclaration(&left, relevant);
+        const b = nextRelevantDeclaration(&right, relevant);
+        if (a == null or b == null) return a == null and b == null;
+        if (!std.mem.eql(u8, a.?.name, b.?.name) or
+            !std.mem.eql(u8, a.?.value, b.?.value) or a.?.important != b.?.important) return false;
+    }
+}
+
+fn nextRelevantDeclaration(iterator: anytype, comptime relevant: fn ([]const u8) bool) ?CssParser.Declaration {
+    while (iterator.next()) |declaration| {
+        var name: [128]u8 = undefined;
+        if (declaration.name.len > name.len) return declaration;
+        const normalized = std.ascii.lowerString(name[0..declaration.name.len], declaration.name);
+        if (relevant(normalized)) return declaration;
+    }
+    return null;
 }
 
 fn selectorUsesStyle(selector: Selector.Selector) bool {
@@ -196,25 +233,21 @@ fn collectProperties(self: *StyleManager, element: *Element, geometry_only: bool
     const memo = if (geometry_only) &self.geometry_memo else &self.layout_memo;
     if (memo.get(element)) |cached| return cached;
     const allocator = memo_arena.allocator();
-    var result: std.ArrayList(LayoutProperty) = .empty;
-    for (try self.matchingRules(element, geometry_only)) |index| {
-        const rule = self.layout_rules.items[index];
-        for (if (geometry_only) rule.geometry_declarations else rule.declarations) |declaration| {
-            try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = if (declaration.important) rule.important_priority else rule.priority });
-        }
+    const stylesheet = try self.stylesheetProperties(element, geometry_only);
+    const inline_style = element.inlineStyle(self.frame);
+    if (inline_style == null) {
+        try memo.put(allocator, element, stylesheet);
+        return stylesheet;
     }
-    if (element.inlineStyle(self.frame)) |style| {
+    var result: std.ArrayList(LayoutProperty) = .empty;
+    try result.appendSlice(allocator, stylesheet);
+    if (inline_style) |style| {
         var iterator = style.asCSSStyleDeclaration().iterator();
         while (iterator.next()) |property| {
             if (geometry_only and !layoutRelevant(property._name.str())) continue;
             try result.append(allocator, .{ .name = property._name.str(), .value = property._value.str(), .priority = if (property._important) std.math.maxInt(u64) else IMPORTANT_BIT - 1 });
         }
     }
-    std.mem.sort(LayoutProperty, result.items, {}, struct {
-        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
-            return a.priority < b.priority;
-        }
-    }.lessThan);
     var winners: std.StringHashMapUnmanaged(usize) = .empty;
     var resolved: std.ArrayList(LayoutProperty) = .empty;
     for (result.items, 0..) |property, order| {
@@ -235,6 +268,41 @@ fn collectProperties(self: *StyleManager, element: *Element, geometry_only: bool
     return resolved.items;
 }
 
+// Matching and stylesheet declarations remain valid across inline-only changes.
+fn stylesheetProperties(self: *StyleManager, element: *Element, geometry_only: bool) ![]LayoutProperty {
+    const rules = try self.matchingRules(element, geometry_only);
+    const connected = self.matched_memo.contains(element);
+    if (self.matched_memo.get(element)) |cached| {
+        if (if (geometry_only) cached.geometry_properties else cached.full_properties) |properties| return properties;
+    }
+    const allocator = if (connected) self.matched_arena.?.allocator() else self.layout_memo_arena.?.allocator();
+    var winners: std.StringHashMapUnmanaged(usize) = .empty;
+    var properties: std.ArrayList(LayoutProperty) = .empty;
+    var order: usize = 0;
+    for (rules) |index| {
+        const rule = self.layout_rules.items[index];
+        for (if (geometry_only) rule.geometry_declarations else rule.declarations) |declaration| {
+            const property = LayoutProperty{ .name = declaration.name, .value = declaration.value, .priority = if (declaration.important) rule.important_priority else rule.priority, .order = order };
+            order += 1;
+            const slot = try winners.getOrPut(allocator, property.name);
+            if (!slot.found_existing) {
+                slot.value_ptr.* = properties.items.len;
+                try properties.append(allocator, property);
+            } else if (property.priority >= properties.items[slot.value_ptr.*].priority) properties.items[slot.value_ptr.*] = property;
+        }
+    }
+    std.mem.sort(LayoutProperty, properties.items, {}, struct {
+        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
+            return if (a.priority == b.priority) a.order < b.order else a.priority < b.priority;
+        }
+    }.lessThan);
+    if (connected) {
+        const cached = self.matched_memo.getPtr(element).?;
+        if (geometry_only) cached.geometry_properties = properties.items else cached.full_properties = properties.items;
+    }
+    return properties.items;
+}
+
 fn matchingRules(self: *StyleManager, element: *Element, geometry_only: bool) ![]u32 {
     const arena = self.matched_arena orelse try self.frame.getArena(.medium, "CSS rule matches");
     self.matched_arena = arena;
@@ -243,10 +311,10 @@ fn matchingRules(self: *StyleManager, element: *Element, geometry_only: bool) ![
         self.matched_memo = .empty;
         self.matched_version = self.frame.page.selector_version;
     }
-    const connected = element.asNode().isConnected();
-    if (connected) if (self.matched_memo.get(element)) |cached| {
+    if (self.matched_memo.get(element)) |cached| {
         if (if (geometry_only) cached.geometry else cached.full) |rules| return rules;
-    };
+    }
+    const connected = element.asNode().isConnected();
     const allocator = if (connected) arena.allocator() else self.frame.call_arena;
     var result: std.ArrayList(u32) = .empty;
     if (element.getId()) |id| if (self.layout_id_rules.get(id)) |rules| try self.matchRules(element, rules.items, geometry_only, &result, allocator);
@@ -1137,7 +1205,7 @@ fn Group(comptime Spec: type) type {
         }
 
         fn freshMemo(self: *Self, frame: *Frame) *std.AutoHashMapUnmanaged(*Element, Computed) {
-            const version = frame.page.style_version;
+            const version = if (Spec == Visibility) frame.page.visibility_version else frame.page.style_version;
             if (self.memo_version != version) {
                 self.memo.clearRetainingCapacity();
                 self.memo_version = version;

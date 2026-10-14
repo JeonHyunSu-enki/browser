@@ -45,8 +45,7 @@ extern fn lp_dom_layout_free(state: ?*anyopaque) void;
 arena: ?*lp.Arena = null,
 rust_state: ?*anyopaque = null,
 boxes: std.AutoHashMapUnmanaged(*Node, Box) = .empty,
-dom_version: usize = std.math.maxInt(usize),
-style_version: usize = std.math.maxInt(usize),
+layout_version: usize = std.math.maxInt(usize),
 viewport_width: u32 = 0,
 viewport_height: u32 = 0,
 
@@ -57,7 +56,7 @@ pub fn deinit(self: *Layout) void {
 
 pub fn ensure(self: *Layout, frame: *Frame) !void {
     const viewport = frame.page.getViewport();
-    if (self.dom_version == frame.page.dom_version and self.style_version == frame.page.style_version and
+    if (self.layout_version == frame.page.layout_version and
         self.viewport_width == viewport.width and self.viewport_height == viewport.height) return;
     const arena = self.arena orelse try frame.getArena(.medium, "DOM layout");
     self.arena = arena;
@@ -158,8 +157,7 @@ pub fn ensure(self: *Layout, frame: *Frame) !void {
     const boxes = try allocator.alloc(Box, inputs.items.len);
     if (lp_dom_layout(inputs.items.ptr, inputs.items.len, @floatFromInt(viewport.width), @floatFromInt(viewport.height), boxes.ptr, &self.rust_state) != 0) return error.LayoutFailed;
     for (nodes.items, boxes) |node, value| try self.boxes.put(allocator, node, value);
-    self.dom_version = frame.page.dom_version;
-    self.style_version = frame.page.style_version;
+    self.layout_version = frame.page.layout_version;
     self.viewport_width = viewport.width;
     self.viewport_height = viewport.height;
 }

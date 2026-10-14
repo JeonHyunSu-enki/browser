@@ -2367,10 +2367,18 @@ pub fn domChanged(self: *Frame) void {
     self.renderingChanged();
 }
 
-pub fn attributeDomChanged(self: *Frame, name: String) void {
+pub fn attributeDomChanged(self: *Frame, name: String, old_value: ?String, new_value: ?String) void {
     if (!name.eqlSlice("style") or self._style_manager.selectors_use_style) return self.domChanged();
     self.page.dom_version += 1;
     self.page.style_version += 1;
+    if (self._style_manager.dirty or !@import("StyleManager.zig").sameLayoutDeclarations(
+        if (old_value) |v| v.str() else "",
+        if (new_value) |v| v.str() else "",
+    )) self.page.layout_version += 1;
+    if (self._style_manager.dirty or !@import("StyleManager.zig").sameVisibilityDeclarations(
+        if (old_value) |v| v.str() else "",
+        if (new_value) |v| v.str() else "",
+    )) self.page.visibility_version += 1;
     observers.scheduleIntersectionChecks(self);
     observers.scheduleResizeChecks(self);
 }
@@ -2388,6 +2396,8 @@ pub fn renderingChanged(self: *Frame) void {
 pub fn styleChanged(self: *Frame) void {
     self.page.style_version += 1;
     self.page.selector_version += 1;
+    self.page.layout_version += 1;
+    self.page.visibility_version += 1;
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
