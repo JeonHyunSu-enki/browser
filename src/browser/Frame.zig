@@ -2367,6 +2367,14 @@ pub fn domChanged(self: *Frame) void {
     self.renderingChanged();
 }
 
+pub fn attributeDomChanged(self: *Frame, name: String) void {
+    if (!name.eqlSlice("style") or self._style_manager.selectors_use_style) return self.domChanged();
+    self.page.dom_version += 1;
+    self.page.style_version += 1;
+    observers.scheduleIntersectionChecks(self);
+    observers.scheduleResizeChecks(self);
+}
+
 /// A style change that is also our "rendering opportunity": re-evaluate the
 /// layout observers. Both are no-ops unless something they track changed.
 pub fn renderingChanged(self: *Frame) void {
@@ -2379,6 +2387,7 @@ pub fn renderingChanged(self: *Frame) void {
 /// result, including non-tree state that live collections never see.
 pub fn styleChanged(self: *Frame) void {
     self.page.style_version += 1;
+    self.page.selector_version += 1;
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };

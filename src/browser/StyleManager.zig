@@ -69,6 +69,11 @@ layout_tag_rules: std.AutoHashMapUnmanaged(Tag, std.ArrayList(u32)) = .empty,
 layout_other_rules: std.ArrayList(u32) = .empty,
 layout_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
 geometry_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
+selectors_use_style: bool = false,
+matched_arena: ?*lp.Arena = null,
+matched_version: usize = std.math.maxInt(usize),
+matched_memo: std.AutoHashMapUnmanaged(*Element, MatchedRules) = .empty,
+
 layout_memo_arena: ?*lp.Arena = null,
 layout_memo_version: usize = std.math.maxInt(usize),
 font_size_memo: std.AutoHashMapUnmanaged(*Element, f64) = .empty,
@@ -97,6 +102,7 @@ dirty: bool = false,
 // or to a later sheet, stays last in cascade order.
 last_rule_sheet: ?*CSSStyleSheet = null,
 
+const MatchedRules = struct { geometry: ?[]u32 = null, full: ?[]u32 = null };
 pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64, order: usize = 0 };
 const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, geometry_declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
 
@@ -117,6 +123,26 @@ fn layoutRelevant(name: []const u8) bool {
     return false;
 }
 
+fn selectorUsesStyle(selector: Selector.Selector) bool {
+    if (compoundUsesStyle(selector.first)) return true;
+    for (selector.segments) |segment| if (compoundUsesStyle(segment.compound)) return true;
+    return false;
+}
+
+fn compoundUsesStyle(compound: Selector.Compound) bool {
+    for (compound.parts) |part| switch (part) {
+        .attribute => |attribute| if (std.ascii.eqlIgnoreCase(attribute.name.str(), "style")) return true,
+        .pseudo_class => |pseudo| switch (pseudo) {
+            .not, .is, .where, .has => |selectors| for (selectors) |selector| {
+                if (selectorUsesStyle(selector)) return true;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    return false;
+}
+
 fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, layer: u16) !void {
     const allocator = self.arena.allocator();
     var declarations: std.ArrayList(CssParser.Declaration) = .empty;
@@ -134,6 +160,7 @@ fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, 
     for (declarations.items) |declaration| if (layoutRelevant(declaration.name)) try geometry_declarations.append(allocator, declaration);
     const priority = try self.nextPriority(layer);
     for (SelectorParser.parseList(allocator, selectors) catch return) |selector| {
+        self.selectors_use_style = self.selectors_use_style or selectorUsesStyle(selector);
         try self.layout_rules.append(allocator, .{ .selector = selector, .declarations = declarations.items, .geometry_declarations = geometry_declarations.items, .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT), .important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK) | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) });
         const index: u32 = @intCast(self.layout_rules.items.len - 1);
         const key = getBucketKey(selector.rightmost()) orelse .other;
@@ -170,17 +197,12 @@ fn collectProperties(self: *StyleManager, element: *Element, geometry_only: bool
     if (memo.get(element)) |cached| return cached;
     const allocator = memo_arena.allocator();
     var result: std.ArrayList(LayoutProperty) = .empty;
-    if (element.getId()) |id| {
-        if (self.layout_id_rules.get(id)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
-    }
-    if (element.getClassName()) |classes| {
-        var tokens = std.mem.tokenizeAny(u8, classes, &std.ascii.whitespace);
-        while (tokens.next()) |class| {
-            if (self.layout_class_rules.get(class)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
+    for (try self.matchingRules(element, geometry_only)) |index| {
+        const rule = self.layout_rules.items[index];
+        for (if (geometry_only) rule.geometry_declarations else rule.declarations) |declaration| {
+            try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = if (declaration.important) rule.important_priority else rule.priority });
         }
     }
-    if (self.layout_tag_rules.get(element.getTag())) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator, geometry_only);
-    try self.collectLayoutRules(element, self.layout_other_rules.items, &result, allocator, geometry_only);
     if (element.inlineStyle(self.frame)) |style| {
         var iterator = style.asCSSStyleDeclaration().iterator();
         while (iterator.next()) |property| {
@@ -213,16 +235,39 @@ fn collectProperties(self: *StyleManager, element: *Element, geometry_only: bool
     return resolved.items;
 }
 
-fn collectLayoutRules(self: *StyleManager, element: *Element, indices: []const u32, result: *std.ArrayList(LayoutProperty), allocator: Allocator, geometry_only: bool) !void {
+fn matchingRules(self: *StyleManager, element: *Element, geometry_only: bool) ![]u32 {
+    const arena = self.matched_arena orelse try self.frame.getArena(.medium, "CSS rule matches");
+    self.matched_arena = arena;
+    if (self.matched_version != self.frame.page.selector_version) {
+        arena.resetRetain();
+        self.matched_memo = .empty;
+        self.matched_version = self.frame.page.selector_version;
+    }
+    const connected = element.asNode().isConnected();
+    if (connected) if (self.matched_memo.get(element)) |cached| {
+        if (if (geometry_only) cached.geometry else cached.full) |rules| return rules;
+    };
+    const allocator = if (connected) arena.allocator() else self.frame.call_arena;
+    var result: std.ArrayList(u32) = .empty;
+    if (element.getId()) |id| if (self.layout_id_rules.get(id)) |rules| try self.matchRules(element, rules.items, geometry_only, &result, allocator);
+    if (element.getClassName()) |classes| {
+        var tokens = std.mem.tokenizeAny(u8, classes, &std.ascii.whitespace);
+        while (tokens.next()) |class| if (self.layout_class_rules.get(class)) |rules| try self.matchRules(element, rules.items, geometry_only, &result, allocator);
+    }
+    if (self.layout_tag_rules.get(element.getTag())) |rules| try self.matchRules(element, rules.items, geometry_only, &result, allocator);
+    try self.matchRules(element, self.layout_other_rules.items, geometry_only, &result, allocator);
+    if (connected) {
+        const cached = try self.matched_memo.getOrPutValue(allocator, element, .{});
+        if (geometry_only) cached.value_ptr.geometry = result.items else cached.value_ptr.full = result.items;
+    }
+    return result.items;
+}
+
+fn matchRules(self: *StyleManager, element: *Element, indices: []const u32, geometry_only: bool, result: *std.ArrayList(u32), allocator: Allocator) !void {
     for (indices) |index| {
         const rule = self.layout_rules.items[index];
-        const declarations = if (geometry_only) rule.geometry_declarations else rule.declarations;
-        if (declarations.len == 0) continue;
-        if (!matchesSelector(element, rule.selector, self.frame)) continue;
-        for (declarations) |declaration| {
-            const priority = if (declaration.important) rule.important_priority else rule.priority;
-            try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = priority });
-        }
+        if ((if (geometry_only) rule.geometry_declarations else rule.declarations).len == 0) continue;
+        if (matchesSelector(element, rule.selector, self.frame)) try result.append(allocator, index);
     }
 }
 
@@ -244,6 +289,7 @@ pub fn init(frame: *Frame) !StyleManager {
 
 pub fn deinit(self: *StyleManager) void {
     if (self.layout_memo_arena) |arena| arena.release();
+    if (self.matched_arena) |arena| arena.release();
     self.arena.release();
 }
 
@@ -763,6 +809,7 @@ fn rebuildIfDirty(self: *StyleManager) !void {
 
     self.custom_rules = .empty;
     self.layout_rules = .empty;
+    self.selectors_use_style = false;
     self.layout_id_rules = .empty;
     self.layout_class_rules = .empty;
     self.layout_tag_rules = .empty;

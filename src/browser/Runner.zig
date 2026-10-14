@@ -227,7 +227,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
 
     if (has_runnable_page) {
         // Yield between tasks so repeating timers cannot delay CDP commands.
-        try browser.runMacrotasksFor(if (is_cdp) 8 else 500);
+        try browser.runMacrotasksFor(if (is_cdp) 1 else 500);
     }
 
     const activity = http_client.activity();
