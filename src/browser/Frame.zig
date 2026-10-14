@@ -88,6 +88,7 @@ const Allocator = std.mem.Allocator;
 pub const BUF_SIZE = 1024;
 
 const Frame = @This();
+const Layout = @import("Layout.zig");
 
 // This is the "id" of the frame. It can be re-used from frame-to-frame, e.g.
 // when navigating.
@@ -124,6 +125,7 @@ _fragment_scripts_runnable: bool = false,
 // File objects (reference counted via their Blob proto); released at teardown.
 _file_lists: std.ArrayList(*FileList) = .empty,
 animations: std.ArrayList(*Animation) = .empty,
+layout: Layout = .{},
 
 // List of Documents which called document.open() and potentially need to have
 // the parser freed.
@@ -547,6 +549,7 @@ pub fn deinit(self: *Frame) void {
 
     self._script_manager.deinit();
     self._style_manager.deinit();
+    self.layout.deinit();
 
     self._call_arena.release();
     self._local_arena.release();

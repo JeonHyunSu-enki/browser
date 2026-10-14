@@ -52,6 +52,7 @@ _observations: std.ArrayList(Observation) = .empty,
 const Observation = struct {
     target: *Element,
     connected: bool = false,
+    border_box: bool = false,
     last_width: f64 = 0,
     last_height: f64 = 0,
 };
@@ -86,15 +87,13 @@ pub fn releaseRef(self: *ResizeObserver, page: *Page) void {
 }
 
 pub fn observe(self: *ResizeObserver, target: *Element, options_: ?Options, frame: *Frame) !void {
-    _ = options_; // Can't make use of this
-
     for (self._observations.items) |obs| {
         if (obs.target == target) {
             return;
         }
     }
 
-    try self._observations.append(self._arena.allocator(), .{ .target = target });
+    try self._observations.append(self._arena.allocator(), .{ .target = target, .border_box = if (options_) |options| std.mem.eql(u8, options.box, "border-box") else false });
     if (self._observations.items.len == 1) {
         try Frame.observers.registerResizeObserver(frame, self);
     }
@@ -162,19 +161,23 @@ pub fn deliverEntries(self: *ResizeObserver, frame: *Frame) !void {
             if (!connected or !target.isVisible(frame)) {
                 break :blk .{ 0, 0 };
             }
-            break :blk .{
-                target.getElementAxis(frame, .width).value,
-                target.getElementAxis(frame, .height).value,
-            };
+            const box = frame.layout.box(target.asNode(), frame);
+            break :blk .{ @as(f64, @max(0, box.width - box.border_left - box.border_right - box.padding_left - box.padding_right)), @as(f64, @max(0, box.height - box.border_top - box.border_bottom - box.padding_top - box.padding_bottom)) };
         };
 
-        if (width == obs.last_width and height == obs.last_height) {
+        const box = frame.layout.box(target.asNode(), frame);
+        const watched_width: f64 = if (obs.border_box) box.width else width;
+        const watched_height: f64 = if (obs.border_box) box.height else height;
+        if (watched_width == obs.last_width and watched_height == obs.last_height) {
             continue;
         }
-        obs.last_width = width;
-        obs.last_height = height;
+        obs.last_width = watched_width;
+        obs.last_height = watched_height;
 
         const entry = try ResizeObserverEntry.create(obs.target, width, height, frame._factory);
+        entry._border_size = .{try ResizeObserverSize.create(box.width, box.height, frame._factory)};
+        const scale = frame.page.getViewport().scale;
+        entry._device_size = .{try ResizeObserverSize.create(width * scale, height * scale, frame._factory)};
         try entries.append(frame.call_arena, entry);
     }
 
@@ -196,6 +199,8 @@ pub const ResizeObserverEntry = struct {
     _target: *Element,
     _content_rect: *DOMRect,
     _box_size: [1]*ResizeObserverSize,
+    _border_size: [1]*ResizeObserverSize,
+    _device_size: [1]*ResizeObserverSize,
 
     pub fn create(target: *Element, width: f64, height: f64, factory: *Factory) !*ResizeObserverEntry {
         const content_rect = try DOMRect.create(.{ .width = width, .height = height }, factory);
@@ -204,6 +209,8 @@ pub const ResizeObserverEntry = struct {
             ._target = target,
             ._content_rect = content_rect,
             ._box_size = .{size},
+            ._border_size = .{size},
+            ._device_size = .{size},
         });
     }
 
@@ -216,7 +223,7 @@ pub const ResizeObserverEntry = struct {
     }
 
     fn getBorderBoxSize(self: *const ResizeObserverEntry) []const *ResizeObserverSize {
-        return &self._box_size;
+        return &self._border_size;
     }
 
     fn getContentBoxSize(self: *const ResizeObserverEntry) []const *ResizeObserverSize {
@@ -224,7 +231,7 @@ pub const ResizeObserverEntry = struct {
     }
 
     fn getDevicePixelContentBoxSize(self: *const ResizeObserverEntry) []const *ResizeObserverSize {
-        return &self._box_size;
+        return &self._device_size;
     }
 
     pub const JsApi = struct {

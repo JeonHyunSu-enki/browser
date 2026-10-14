@@ -1305,7 +1305,7 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
     for ([_]struct { id: lp.NodeRegistry.Id, y: i32 }{ .{ .id = scrollbox_id, .y = 50 }, .{ .id = plain_id, .y = 7 } }) |c| {
         const msg = try aa.print("{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"scroll\",\"arguments\":{{\"backendNodeId\":{d},\"y\":{d}}}}}}}", .{ c.id, c.y });
         try router.handleMessage(server, aa, msg);
-        const expected = try aa.print("Scrolled element (backendNodeId: {d}) to x: 0, y: {d}", .{ c.id, c.y });
+        const expected = try aa.print("Scrolled element (backendNodeId: {d}) to x: 0, y: {d}", .{ c.id, if (c.id == plain_id) @as(i32, 0) else c.y });
         try testing.expect(std.mem.find(u8, out.written(), expected) != null);
         out.clearRetainingCapacity();
     }
@@ -1442,7 +1442,7 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
         \\ document.getElementById('outerscroll').scrollTop === 30 &&
         \\ document.getElementById('innerleaf').scrollTop === 0 &&
         \\ document.getElementById('sheetscroll').scrollTop === 30 &&
-        \\ document.getElementById('plain').scrollTop === 7 &&
+        \\ document.getElementById('plain').scrollTop === 0 &&
         \\ window.scrollX === 5 && window.scrollY === 20 &&
         \\ window.hovered === true &&
         \\ window.keyPressed === 'Enter' && window.keyCode === 'Enter' && window.keyReleased === 'Enter' &&

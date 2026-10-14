@@ -124,6 +124,20 @@ const TokenStream = struct {
     }
 };
 
+pub fn validLengthDeclaration(name: []const u8, value: []const u8) bool {
+    const nonnegative = std.mem.eql(u8, name, "width") or std.mem.eql(u8, name, "height") or
+        std.mem.startsWith(u8, name, "min-") or std.mem.startsWith(u8, name, "max-") or
+        std.mem.startsWith(u8, name, "padding") or std.mem.eql(u8, name, "font-size") or
+        (std.mem.startsWith(u8, name, "border-") and std.mem.endsWith(u8, name, "width"));
+    if (!nonnegative) return true;
+    var parts = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+    while (parts.next()) |part| {
+        const length = @import("units.zig").parse(part) catch continue;
+        if (length.value < 0) return false;
+    }
+    return true;
+}
+
 pub fn parseDeclarationsList(input: []const u8) DeclarationsIterator {
     return DeclarationsIterator.init(input);
 }
@@ -152,7 +166,7 @@ const DeclarationsIterator = struct {
                 .ident => |name| {
                     _ = self.stream.next();
                     if (self.consumeDeclaration(name)) |declaration| {
-                        return declaration;
+                        if (validLengthDeclaration(declaration.name, declaration.value)) return declaration;
                     }
                 },
                 else => {

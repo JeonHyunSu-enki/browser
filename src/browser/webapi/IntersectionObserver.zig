@@ -49,10 +49,17 @@ _threshold: []const f64 = &.{0.0},
 _pending_entries: std.ArrayList(*IntersectionObserverEntry) = .empty,
 // tracked targets that aren't reported yet
 _tracked: std.AutoHashMapUnmanaged(*Element, void) = .{},
+_last_states: std.AutoHashMapUnmanaged(*Element, IntersectionState) = .{},
+_last_style_version: usize = std.math.maxInt(usize),
+_last_scroll_version: usize = std.math.maxInt(usize),
+_last_width: u32 = 0,
+_last_height: u32 = 0,
 
 // Shared zero rect (plain values) for non-intersecting elements. Materialized
 // into a DOMRect only if it ends up on a delivered entry.
 const zero_rect: DOMRect.Data = .{};
+
+const IntersectionState = struct { intersecting: bool, threshold: usize };
 
 const ObserverInit = struct {
     root: ?*Node = null,
@@ -148,6 +155,7 @@ fn unobserve(self: *IntersectionObserver, target: *Element, frame: *Frame) void 
         if (elem == target) {
             _ = self._observing.swapRemove(i);
             _ = self._tracked.remove(target);
+            _ = self._last_states.remove(target);
 
             // Remove any pending entries for this target.
             var j: usize = 0;
@@ -173,6 +181,7 @@ pub fn reset(self: *IntersectionObserver, page: *Page) void {
     releaseAll(self._pending_entries.items, page);
     self._pending_entries.clearRetainingCapacity();
     self._tracked.clearRetainingCapacity();
+    self._last_states.clearRetainingCapacity();
     self._observing.clearRetainingCapacity();
 }
 
@@ -204,41 +213,58 @@ fn releaseAll(entries: []const *IntersectionObserverEntry, page: *Page) void {
     }
 }
 
-fn calculateIntersection(
-    self: *IntersectionObserver,
-    target: *Element,
-    has_parent: bool,
-    frame: *Frame,
-) !IntersectionData {
+fn intersect(a: DOMRect.Data, b: DOMRect.Data) DOMRect.Data {
+    const left = @max(a.x, b.x);
+    const top = @max(a.y, b.y);
+    const right = @min(a.x + a.width, b.x + b.width);
+    const bottom = @min(a.y + a.height, b.y + b.height);
+    return .{ .x = left, .y = top, .width = @max(0, right - left), .height = @max(0, bottom - top) };
+}
+
+fn calculateIntersection(self: *IntersectionObserver, target: *Element, has_parent: bool, frame: *Frame) !IntersectionData {
     const target_rect = target.boundingClientRectValues(frame);
-
-    // Use root element's rect or the faux-layout viewport.
-    const root_rect = if (self._root) |root|
-        root.boundingClientRectValues(frame)
-    else blk: {
-        const viewport = frame.page.getViewport();
-        break :blk DOMRect.Data{
-            .width = @floatFromInt(viewport.width),
-            .height = @floatFromInt(viewport.height),
-        };
+    const viewport = frame.page.getViewport();
+    var root_rect = if (self._root) |root| root.boundingClientRectValues(frame) else DOMRect.Data{
+        .width = @floatFromInt(viewport.width),
+        .height = @floatFromInt(viewport.height),
     };
-
-    // For a headless browser without real layout, we treat all elements as fully visible.
-    // This avoids fingerprinting issues (massive viewports) and matches the behavior
-    // scripts expect when querying element visibility.
-    // However, elements without a parent cannot intersect (they have no containing block).
-    const intersection_ratio: f64 = if (has_parent) 1.0 else 0.0;
-
-    // Intersection rect is the same as the target rect if visible, otherwise zero rect
-    const intersection_rect = if (has_parent) target_rect else zero_rect;
-
-    return .{
-        .is_intersecting = has_parent,
-        .intersection_ratio = intersection_ratio,
-        .intersection_rect = intersection_rect,
-        .bounding_client_rect = target_rect,
-        .root_bounds = root_rect,
-    };
+    var tokens = std.mem.tokenizeAny(u8, self._root_margin, &std.ascii.whitespace);
+    var margins: [4]f64 = @splat(0);
+    var count: usize = 0;
+    while (tokens.next()) |token| {
+        if (count == 4) break;
+        if (std.mem.endsWith(u8, token, "%")) {
+            margins[count] = (std.fmt.parseFloat(f64, token[0 .. token.len - 1]) catch 0) * root_rect.width / 100;
+        } else if (std.mem.endsWith(u8, token, "px")) {
+            margins[count] = std.fmt.parseFloat(f64, token[0 .. token.len - 2]) catch 0;
+        }
+        count += 1;
+    }
+    if (count == 1) margins = @splat(margins[0]);
+    if (count == 2) {
+        margins[2] = margins[0];
+        margins[3] = margins[1];
+    }
+    if (count == 3) margins[3] = margins[1];
+    root_rect.x -= margins[3];
+    root_rect.y -= margins[0];
+    root_rect.width += margins[1] + margins[3];
+    root_rect.height += margins[0] + margins[2];
+    const connected = has_parent and target.asNode().isConnected() and target.isVisible(frame) and
+        (if (self._root) |root| root.asNode().contains(target.asNode()) else true);
+    var clipped = intersect(target_rect, root_rect);
+    var ancestor = target.parentElement();
+    while (ancestor) |element| : (ancestor = element.parentElement()) {
+        if (self._root == element) break;
+        const overflow = frame._style_manager.cascadedProperty(element, "overflow") orelse "visible";
+        if (!std.mem.eql(u8, overflow, "visible")) clipped = intersect(clipped, element.boundingClientRectValues(frame));
+    }
+    const intersects = connected and target_rect.x <= root_rect.x + root_rect.width and
+        target_rect.y <= root_rect.y + root_rect.height and target_rect.x + target_rect.width >= root_rect.x and
+        target_rect.y + target_rect.height >= root_rect.y;
+    const area = target_rect.width * target_rect.height;
+    const ratio = if (!intersects) 0 else if (area == 0) 1 else clipped.width * clipped.height / area;
+    return .{ .is_intersecting = intersects, .intersection_ratio = ratio, .intersection_rect = if (intersects) clipped else zero_rect, .bounding_client_rect = target_rect, .root_bounds = root_rect };
 }
 
 const IntersectionData = struct {
@@ -259,24 +285,17 @@ fn meetsThreshold(self: *IntersectionObserver, ratio: f64) bool {
 }
 
 fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Frame) !void {
-    const tracked = self._tracked.getEntry(target) orelse {
-        // If target isn't tracked then it was already reported. This is an
-        // important optimization which lets us skip the heavy work below.
-        // This function can be called a lot.
-        return;
-    };
-
     const has_parent = target.asNode().parentNode() != null;
-    const is_now_intersecting = has_parent and self.meetsThreshold(1.0);
-    if (!is_now_intersecting) {
-        // Not intersecting yet (e.g. observed while still orphaned) — keep
-        // tracking so a later attach is reported.
-        return;
-    }
-
-    // Building the entry is the expensive part — getBoundingClientRect walks the
-    // document to fake a position (O(node count)) — so it only runs here.
     const data = try self.calculateIntersection(target, has_parent, frame);
+    var threshold: usize = 0;
+    for (self._threshold) |value| {
+        if (data.intersection_ratio >= value) threshold += 1;
+    }
+    const state = IntersectionState{ .intersecting = data.is_intersecting, .threshold = threshold };
+    if (self._last_states.get(target)) |last| {
+        if (!self._tracked.contains(target) and last.intersecting == state.intersecting and last.threshold == state.threshold) return;
+    }
+    try self._last_states.put(self._arena.allocator(), target, state);
     const arena = try frame.getArena(.tiny, "IntersectionObserverEntry");
     errdefer arena.release();
 
@@ -286,20 +305,28 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Fram
         ._arena = arena,
         ._target = target,
         ._time = frame.window._performance.now(),
-        ._is_intersecting = is_now_intersecting,
+        ._is_intersecting = data.is_intersecting,
         ._root_bounds = try DOMRect.create(data.root_bounds, frame._factory),
         ._intersection_rect = try DOMRect.create(data.intersection_rect, frame._factory),
         ._bounding_client_rect = try DOMRect.create(data.bounding_client_rect, frame._factory),
         ._intersection_ratio = data.intersection_ratio,
     };
     try self._pending_entries.append(self._arena.allocator(), entry);
-    _ = self._tracked.removeByPtr(tracked.key_ptr);
+    _ = self._tracked.remove(target);
 }
 
 pub fn checkIntersections(self: *IntersectionObserver, frame: *Frame) !void {
     if (self._observing.items.len == 0) {
         return;
     }
+
+    const viewport = frame.page.getViewport();
+    if (self._tracked.count() == 0 and self._last_style_version == frame.page.style_version and self._last_scroll_version == frame.page.scroll_version and
+        self._last_width == viewport.width and self._last_height == viewport.height) return;
+    self._last_style_version = frame.page.style_version;
+    self._last_scroll_version = frame.page.scroll_version;
+    self._last_width = viewport.width;
+    self._last_height = viewport.height;
 
     for (self._observing.items) |target| {
         try self.checkIntersection(target, frame);
@@ -434,6 +461,12 @@ fn observeSentinelChain(frame: *Frame, comptime deferred: bool) !void {
     try ls.local.eval(
         \\(function(deferred) {
         \\  const list = document.createElement('div');
+        \\  if (!document.documentElement) {
+        \\    const html = document.createElement('html');
+        \\    document.appendChild(html);
+        \\    html.appendChild(document.createElement('body'));
+        \\  }
+        \\  (document.body || document.documentElement).appendChild(list);
         \\  const observe = () => io.observe(list.insertBefore(document.createElement('div'), list.firstChild));
         \\  const io = new IntersectionObserver((entries) => {
         \\    for (const entry of entries) {

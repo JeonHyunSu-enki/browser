@@ -8,6 +8,7 @@ name = "lightpanda_render"
 path = "lib.rs"
 
 [dependencies]
+taffy = { git = "https://github.com/DioxusLabs/taffy", rev = "6c2106e3df79493d304f954dc2cd4a4a382981d3", features = ["parse"] }
 parley = { version = "0.11.1", default-features = false, features = ["std"] }
 fontique = { version = "0.11.1", default-features = false, features = ["std"] }
 skrifa = "0.44"

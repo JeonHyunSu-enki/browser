@@ -23,6 +23,7 @@ const Frame = @import("Frame.zig");
 const Viewport = @import("Viewport.zig");
 
 const units = @import("css/units.zig");
+const Variables = @import("css/Variables.zig");
 const CssParser = @import("css/Parser.zig");
 const MediaQuery = @import("css/MediaQuery.zig");
 const Element = @import("webapi/Element.zig");
@@ -61,6 +62,15 @@ text: Group(Text) = .{},
 
 // Keyed by property name, pruning to what is (hopefully) one or few rules
 custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
+layout_rules: std.ArrayList(LayoutRule) = .empty,
+layout_id_rules: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+layout_class_rules: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+layout_tag_rules: std.AutoHashMapUnmanaged(Tag, std.ArrayList(u32)) = .empty,
+layout_other_rules: std.ArrayList(u32) = .empty,
+layout_memo: std.AutoHashMapUnmanaged(*Element, []LayoutProperty) = .empty,
+layout_memo_arena: ?*lp.Arena = null,
+layout_memo_version: usize = std.math.maxInt(usize),
+font_size_memo: std.AutoHashMapUnmanaged(*Element, f64) = .empty,
 
 /// The thing to remember about layers is that we can't determine priority's
 /// layer_rank until everything is parsed. So we need to build up meta data when
@@ -86,6 +96,112 @@ dirty: bool = false,
 // or to a later sheet, stays last in cascade order.
 last_rule_sheet: ?*CSSStyleSheet = null,
 
+pub const LayoutProperty = struct { name: []const u8, value: []const u8, priority: u64, order: usize = 0 };
+const LayoutRule = struct { selector: Selector.Selector, declarations: []const CssParser.Declaration, priority: u64, important_priority: u64 };
+
+fn addLayoutRule(self: *StyleManager, selectors: []const u8, block: []const u8, layer: u16) !void {
+    const allocator = self.arena.allocator();
+    var declarations: std.ArrayList(CssParser.Declaration) = .empty;
+    var parser = CssParser.parseDeclarationsList(block);
+    while (parser.next()) |declaration| {
+        if (!CssParser.validLengthDeclaration(declaration.name, declaration.value)) continue;
+        const name = try allocator.dupe(u8, declaration.name);
+        if (!std.mem.startsWith(u8, name, "--")) for (name) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        };
+        try declarations.append(allocator, .{ .name = name, .value = try allocator.dupe(u8, declaration.value), .important = declaration.important });
+    }
+    if (declarations.items.len == 0) return;
+    const priority = try self.nextPriority(layer);
+    for (SelectorParser.parseList(allocator, selectors) catch return) |selector| {
+        try self.layout_rules.append(allocator, .{ .selector = selector, .declarations = declarations.items, .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT), .important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK) | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) });
+        const index: u32 = @intCast(self.layout_rules.items.len - 1);
+        const key = getBucketKey(selector.rightmost()) orelse .other;
+        const bucket: *std.ArrayList(u32) = switch (key) {
+            .id => |id| (try self.layout_id_rules.getOrPutValue(allocator, id, .empty)).value_ptr,
+            .class => |class| (try self.layout_class_rules.getOrPutValue(allocator, class, .empty)).value_ptr,
+            .tag => |tag| (try self.layout_tag_rules.getOrPutValue(allocator, tag, .empty)).value_ptr,
+            .other => &self.layout_other_rules,
+        };
+        try bucket.append(allocator, index);
+    }
+}
+
+pub fn layoutProperties(self: *StyleManager, element: *Element, _: Allocator) ![]LayoutProperty {
+    try self.rebuildIfDirty();
+    const memo_arena = self.layout_memo_arena orelse try self.frame.getArena(.medium, "Layout styles");
+    self.layout_memo_arena = memo_arena;
+    if (self.layout_memo_version != self.frame.page.style_version) {
+        memo_arena.resetRetain();
+        self.layout_memo = .empty;
+        self.font_size_memo = .empty;
+        self.layout_memo_version = self.frame.page.style_version;
+    }
+    if (self.layout_memo.get(element)) |properties| return properties;
+    const allocator = memo_arena.allocator();
+    var result: std.ArrayList(LayoutProperty) = .empty;
+    if (element.getId()) |id| {
+        if (self.layout_id_rules.get(id)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
+    }
+    if (element.getClassName()) |classes| {
+        var tokens = std.mem.tokenizeAny(u8, classes, &std.ascii.whitespace);
+        while (tokens.next()) |class| {
+            if (self.layout_class_rules.get(class)) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
+        }
+    }
+    if (self.layout_tag_rules.get(element.getTag())) |rules| try self.collectLayoutRules(element, rules.items, &result, allocator);
+    try self.collectLayoutRules(element, self.layout_other_rules.items, &result, allocator);
+    if (element.inlineStyle(self.frame)) |style| {
+        var iterator = style.asCSSStyleDeclaration().iterator();
+        while (iterator.next()) |property| {
+            try result.append(allocator, .{ .name = property._name.str(), .value = property._value.str(), .priority = if (property._important) std.math.maxInt(u64) else IMPORTANT_BIT - 1 });
+        }
+    }
+    std.mem.sort(LayoutProperty, result.items, {}, struct {
+        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
+            return a.priority < b.priority;
+        }
+    }.lessThan);
+    var winners: std.StringHashMapUnmanaged(usize) = .empty;
+    var resolved: std.ArrayList(LayoutProperty) = .empty;
+    for (result.items, 0..) |property, order| {
+        const slot = try winners.getOrPut(allocator, property.name);
+        var value = property;
+        value.order = order;
+        if (!slot.found_existing) {
+            slot.value_ptr.* = resolved.items.len;
+            try resolved.append(allocator, value);
+        } else if (value.priority >= resolved.items[slot.value_ptr.*].priority) resolved.items[slot.value_ptr.*] = value;
+    }
+    std.mem.sort(LayoutProperty, resolved.items, {}, struct {
+        fn lessThan(_: void, a: LayoutProperty, b: LayoutProperty) bool {
+            return if (a.priority == b.priority) a.order < b.order else a.priority < b.priority;
+        }
+    }.lessThan);
+    try self.layout_memo.put(allocator, element, resolved.items);
+    return resolved.items;
+}
+
+fn collectLayoutRules(self: *StyleManager, element: *Element, indices: []const u32, result: *std.ArrayList(LayoutProperty), allocator: Allocator) !void {
+    for (indices) |index| {
+        const rule = self.layout_rules.items[index];
+        if (!matchesSelector(element, rule.selector, self.frame)) continue;
+        for (rule.declarations) |declaration| {
+            const priority = if (declaration.important) rule.important_priority else rule.priority;
+            try result.append(allocator, .{ .name = declaration.name, .value = declaration.value, .priority = priority });
+        }
+    }
+}
+
+pub fn cascadedProperty(self: *StyleManager, element: *Element, name: []const u8) ?[]const u8 {
+    const properties = self.layoutProperties(element, self.frame.call_arena) catch return null;
+    var found: ?[]const u8 = null;
+    for (properties) |property| if (std.ascii.eqlIgnoreCase(property.name, name)) {
+        found = property.value;
+    };
+    return found;
+}
+
 pub fn init(frame: *Frame) !StyleManager {
     return .{
         .frame = frame,
@@ -94,6 +210,7 @@ pub fn init(frame: *Frame) !StyleManager {
 }
 
 pub fn deinit(self: *StyleManager) void {
+    if (self.layout_memo_arena) |arena| arena.release();
     self.arena.release();
 }
 
@@ -442,6 +559,11 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
         @field(self, field).stampRules(self);
     }
 
+    for (self.layout_rules.items) |*rule| {
+        rule.priority |= self.layerRank(rule.priority) << RANK_SHIFT;
+        rule.important_priority |= self.layerRank(rule.important_priority) << RANK_SHIFT;
+    }
+
     // Custom rules parse their selectors lazily, but the layer ranks are only
     // known now that every sheet has been read
     var custom_it = self.custom_rules.valueIterator();
@@ -472,6 +594,7 @@ fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []cons
     if (selector_text.len == 0) {
         return;
     }
+    try self.addLayoutRule(selector_text, block_text, layer);
     var customs: CustomSink = .{ .allocator = build_arena };
     const folded = try foldDeclarations(Declarations, block_text, &customs);
     _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs.map.values(), layer);
@@ -606,6 +729,11 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     }
 
     self.custom_rules = .empty;
+    self.layout_rules = .empty;
+    self.layout_id_rules = .empty;
+    self.layout_class_rules = .empty;
+    self.layout_tag_rules = .empty;
+    self.layout_other_rules = .empty;
     try self.custom_rules.ensureTotalCapacity(self.arena.allocator(), custom_rules_count);
 
     const sheets = self.frame.document._style_sheets orelse return;
@@ -640,6 +768,17 @@ pub fn display(self: *StyleManager, el: *Element) Display {
     self.assertOwns(el);
     self.rebuildIfDirty() catch return .other;
     return self.visibilityProps(el).display;
+}
+
+pub fn isInline(self: *StyleManager, element: *Element) bool {
+    if (self.cascadedProperty(element, "display")) |value| return std.mem.eql(u8, value, "inline");
+    const tags = std.StaticStringMap(void).initComptime(.{
+        .{ "a", {} },     .{ "span", {} },  .{ "b", {} },    .{ "strong", {} }, .{ "i", {} },    .{ "em", {} },
+        .{ "small", {} }, .{ "label", {} }, .{ "abbr", {} }, .{ "cite", {} },   .{ "code", {} }, .{ "s", {} },
+        .{ "u", {} },     .{ "sub", {} },   .{ "sup", {} },  .{ "time", {} },   .{ "mark", {} }, .{ "q", {} },
+        .{ "bdi", {} },   .{ "bdo", {} },   .{ "br", {} },   .{ "wbr", {} },
+    });
+    return tags.has(element.getTagNameLower()) or element.getTag() == .custom;
 }
 
 /// Computed display:none coming only from inline style or an author stylesheet
@@ -1072,6 +1211,12 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
         return false;
     }
     const style = style_rule._style orelse return false;
+    var text = std.Io.Writer.Allocating.init(self.frame.call_arena);
+    var declarations = style.asCSSStyleDeclaration().iterator();
+    while (declarations.next()) |property| {
+        try text.writer.print("{s}:{s}{s};", .{ property._name.str(), property._value.str(), if (property._important) " !important" else "" });
+    }
+    try self.addLayoutRule(selector_text, text.written(), NO_LAYER);
     const folded = extractDeclared(Declarations, style);
     const customs = try self.extractCustomDeclarations(style);
 
@@ -1838,45 +1983,24 @@ fn importantRuleWins(self: *StyleManager, el: *Element, name: []const u8, value:
     return false;
 }
 
-/// Computed value of a custom property (`--x`) on `el`, or null when nothing
-/// declares it. The value is returned as-is, no var substitution
-pub fn customPropertyValue(self: *StyleManager, el: *Element, property_name: String) ?[]const u8 {
-    self.assertOwns(el);
-    self.rebuildIfDirty() catch return null;
-
-    // Only the rules declaring this name; usually a handful, often none. An
-    // element can still shadow them with an inline declaration, so a miss here
-    // means walking for inline styles, not returning early.
-    const rules = self.parsedCustomRules(property_name.str()) catch |err| blk: {
-        log.err(.browser, "StyleManager customProperty", .{ .err = err });
-        break :blk &.{};
-    };
-
-    var current: ?*Element = el;
-    while (current) |elem| : (current = elem.asNode().flatTreeParentElement(self.frame)) {
-        if (self.inlineStyleValue(elem, property_name)) |value| {
-            return value;
-        }
-
-        var winner: ?[]const u8 = null;
-        var priority: u64 = 0;
-        for (rules) |rule| {
-            if (rule.priority <= priority) {
-                continue;
-            }
-            if (matchesSelector(elem, rule.selector, self.frame) == false) {
-                continue;
-            }
-            winner = rule.value;
-            priority = rule.priority;
-        }
-
-        if (winner) |value| {
-            return value;
-        }
+/// Returns the winning declaration before variable substitution.
+pub fn rawLayoutProperty(self: *StyleManager, element: *Element, name: []const u8) !?[]const u8 {
+    for (try self.layoutProperties(element, self.frame.call_arena)) |property| {
+        if (std.mem.eql(u8, property.name, name)) return property.value;
     }
-
     return null;
+}
+
+pub fn resolveProperty(self: *StyleManager, element: *Element, value: []const u8, allocator: Allocator) !?[]const u8 {
+    if (!Variables.containsReference(value)) return value;
+    return Variables.substitute(self, element, value, allocator, 0) catch |err| switch (err) {
+        error.InvalidCssVariable => null,
+        else => return err,
+    };
+}
+
+pub fn customPropertyValue(self: *StyleManager, element: *Element, property_name: String) ?[]const u8 {
+    return Variables.custom(self, element, property_name.str(), self.frame.call_arena, 0) catch null;
 }
 
 /// Gets the parsed rule for a custom property name
@@ -1914,7 +2038,7 @@ fn parsedCustomRules(self: *StyleManager, name: []const u8) ![]const ParsedCusto
 
 /// Bounds computedFontSize's ancestor recursion (the parent walk and
 /// `inherit`/relative-unit chains share it).
-const MAX_FONT_ANCESTOR_DEPTH = 32;
+const MAX_FONT_ANCESTOR_DEPTH = 256;
 
 /// The font-size an element inherits when nothing declares one and when an
 /// element is part of a frameless document.
@@ -1932,12 +2056,33 @@ fn computedFontSizeAt(self: *StyleManager, element: ?*Element, depth: u8) f64 {
         return DEFAULT_FONT_SIZE;
     }
     const current = element orelse return DEFAULT_FONT_SIZE;
+    _ = self.layoutProperties(current, self.frame.call_arena) catch return DEFAULT_FONT_SIZE;
+    if (self.font_size_memo.get(current)) |size| return size;
+    const size = self.calculateFontSize(current, depth);
+    self.font_size_memo.put(self.layout_memo_arena.?.allocator(), current, size) catch {};
+    return size;
+}
+
+fn calculateFontSize(self: *StyleManager, current: *Element, depth: u8) f64 {
     const parent = current.asNode().flatTreeParentElement(self.frame);
 
-    if (self.inlineStyleValue(current, comptime .wrap("font-size"))) |raw| {
-        if (self.parseFontSize(raw, parent, depth + 1)) |size| {
-            return size;
+    var declared_size: ?[]const u8 = null;
+    var shorthand = false;
+    for (self.layoutProperties(current, self.frame.call_arena) catch &.{}) |property| {
+        if (std.mem.eql(u8, property.name, "font-size") or std.mem.eql(u8, property.name, "font")) {
+            declared_size = property.value;
+            shorthand = std.mem.eql(u8, property.name, "font");
         }
+    }
+    if (declared_size) |declared| {
+        const raw = (self.resolveProperty(current, declared, self.frame.call_arena) catch null) orelse "inherit";
+        if (shorthand) {
+            var words = std.mem.tokenizeAny(u8, raw, &std.ascii.whitespace);
+            while (words.next()) |word| {
+                const end = std.mem.indexOfScalar(u8, word, '/') orelse word.len;
+                if (self.parseFontSize(word[0..end], parent, depth + 1)) |size| return size;
+            }
+        } else if (self.parseFontSize(raw, parent, depth + 1)) |size| return size;
     }
     if (current.getAttributeSafe(comptime .wrap("font-size"))) |raw| {
         if (self.parseFontSize(raw, parent, depth + 1)) |size| {
@@ -2260,7 +2405,7 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
         .{},
         .{ .geometry = .{ .width = .{ .value = 100, .unit = .px }, .height = .{ .value = 96, .unit = .px } } },
         .{ .geometry = .{ .height = .{} } },
-        .{ .geometry = .{ .width = .{}, .height = .{} } },
+        .{ .geometry = .{ .width = .{} } },
         .{ .geometry = .{ .width = .{} } },
     };
 

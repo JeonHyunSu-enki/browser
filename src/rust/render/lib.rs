@@ -23,6 +23,11 @@
 //! with skrifa and filled by tiny-skia.
 
 use std::borrow::Cow;
+mod layout;
+mod tree;
+mod math;
+mod fonts;
+mod inline;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 

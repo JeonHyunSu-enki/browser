@@ -105,6 +105,27 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
         }
     }
 
+    if (self._is_computed) {
+        if (self._element) |element| {
+            if (wrapped.eqlSlice("width")) return resolvedDimension(element, .width, frame);
+            if (wrapped.eqlSlice("height")) return resolvedDimension(element, .height, frame);
+            if (element.ownerFrame(frame)) |owner| {
+                if (isCustomProperty(normalized)) return owner._style_manager.customPropertyValue(element, wrapped) orelse "";
+                if (wrapped.eqlSlice("grid-template-columns") or wrapped.eqlSlice("grid-template-rows")) {
+                    const box = owner.layout.box(element.asNode(), owner);
+                    const columns = wrapped.eqlSlice("grid-template-columns");
+                    const ptr = if (columns) box.grid_columns else box.grid_rows;
+                    const len = if (columns) box.grid_columns_len else box.grid_rows_len;
+                    if (ptr) |value| return value[0..len];
+                }
+                if (wrapped.eqlSlice("font-size")) {
+                    return frame.local_arena.print("{d}px", .{owner._style_manager.computedFontSize(element)}) catch "16px";
+                }
+                if (owner._style_manager.cascadedProperty(element, normalized)) |value| return value;
+            }
+        }
+    }
+
     if (self.declaredValue(wrapped, frame)) |value| {
         return value;
     }
@@ -200,15 +221,31 @@ fn axisPair(self: *const CSSStyleDeclaration, prop: *const Property) ?AxisPair {
     return if (longhand.is_x) .{ .name = name, .x = prop, .y = partner } else .{ .name = name, .x = partner, .y = prop };
 }
 
+extern fn lp_css_absolute_length(value: [*]const u8, len: usize, font: f32, root: f32, width: f32, height: f32, result: *f32) c_int;
+
 fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame: *Frame) []const u8 {
-    if (!element.isVisible(frame)) {
-        return "auto";
+    const owner = element.ownerFrame(frame) orelse return "auto";
+    if (!element.isVisible(owner)) {
+        const raw = owner._style_manager.cascadedProperty(element, @tagName(dimension)) orelse return "auto";
+        const value = (owner._style_manager.resolveProperty(element, raw, frame.local_arena) catch null) orelse return "auto";
+        const viewport = owner.page.getViewport();
+        var absolute: f32 = 0;
+        if (lp_css_absolute_length(value.ptr, value.len, @floatCast(owner._style_manager.computedFontSize(element)), @floatCast(owner._style_manager.computedFontSize(owner.document.getDocumentElement())), @floatFromInt(viewport.width), @floatFromInt(viewport.height), &absolute) == 1) {
+            return frame.local_arena.print("{d}px", .{absolute}) catch "auto";
+        }
+        return value;
     }
-    const value = switch (dimension) {
-        .width => element.boxAxis(frame, .width),
-        .height => element.boxAxis(frame, .height),
-    };
-    return frame.local_arena.print("{d}px", .{value}) catch "auto";
+    if (owner._style_manager.isInline(element)) {
+        const parent = element.asNode().flatTreeParentElement(owner);
+        if (parent == null or (owner._style_manager.display(parent.?) != .flex and owner._style_manager.display(parent.?) != .grid)) return "auto";
+    }
+    const box = owner.layout.box(element.asNode(), owner);
+    const sizing = owner._style_manager.cascadedProperty(element, "box-sizing") orelse "content-box";
+    const border_box = std.mem.eql(u8, sizing, "border-box");
+    const value = if (dimension == .width)
+        if (border_box) box.width else box.width - box.border_left - box.border_right - box.padding_left - box.padding_right
+    else if (border_box) box.height else box.height - box.border_top - box.border_bottom - box.padding_top - box.padding_bottom;
+    return frame.local_arena.print("{d}px", .{@round(@as(f64, @max(0, value)) * 1000) / 1000}) catch "auto";
 }
 
 pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
@@ -283,6 +320,8 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
         const y = try self.setPropertyImpl(shorthand.y, values.y, important, frame);
         return x or y;
     }
+
+    if (!CssParser.validLengthDeclaration(normalized, value)) return false;
 
     // Normalize the value for canonical serialization
     const normalized_value = try normalizePropertyValue(frame.local_arena, normalized, value);

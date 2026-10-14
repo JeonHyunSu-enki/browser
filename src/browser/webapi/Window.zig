@@ -825,6 +825,7 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
         return;
     }
 
+    frame.page.scroll_version += 1;
     self._scroll_pos.x = new_x;
     self._scroll_pos.y = new_y;
     self._scroll_pos.state = .scroll;

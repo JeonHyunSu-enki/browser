@@ -9,8 +9,7 @@
   Custom properties inherit, so the answer depends on the element asked, not
   just on the document: the nearest ancestor that declares the property wins
   outright, and specificity only breaks ties between rules matching that same
-  element. The declared token stream is returned verbatim - `var()` inside a
-  value is NOT substituted.
+  element. References in computed values are substituted before inheritance.
 -->
 
 <style>
@@ -30,7 +29,7 @@
   /* Interaction state can't be resolved statically, so :hover is skipped. */
   #dynamic:hover { --hover-only: nope; }
 
-  /* Values are stored as declared: no var() substitution. */
+  /* Computed values substitute variable references. */
   #alias { --base: 4px; --derived: var(--base); }
 
   /* Nearest ancestor wins over a more specific rule further up. */
@@ -104,11 +103,11 @@
 }
 </script>
 
-<script id=custom_property_no_var_substitution>
+<script id=custom_property_var_substitution>
 {
   const style = getComputedStyle($('#alias'));
   testing.expectEqual('4px', style.getPropertyValue('--base'));
-  testing.expectEqual('var(--base)', style.getPropertyValue('--derived'));
+  testing.expectEqual('4px', style.getPropertyValue('--derived'));
 }
 </script>
 

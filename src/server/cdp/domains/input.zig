@@ -788,6 +788,8 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
         .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 1000 },
     });
     const latched = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 0", null);
+    try testing.expectEqual(400, try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(0, try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
     try testing.expect(latched.isTrue());
 
     // Saturated now, so the next wheel latches to the viewport instead.
@@ -797,7 +799,12 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
         .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 100 },
     });
     const chained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
+    try testing.expectEqual(400, try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(100, try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
     try testing.expect(chained.isTrue());
+
+    const visible_x = try (try ls.local.compileAndRun("document.getElementById('outerscroll').getBoundingClientRect().x + 1", null)).toF64();
+    const visible_y = try (try ls.local.compileAndRun("document.getElementById('outerscroll').getBoundingClientRect().y + 1", null)).toF64();
 
     // overscroll-behavior keeps the latch on a container that can't move, so
     // nothing scrolls at all.
@@ -805,7 +812,7 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
     try ctx.processMessage(.{
         .id = 3,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 100 },
+        .params = .{ .type = "mouseWheel", .x = visible_x, .y = visible_y, .deltaY = 100 },
     });
     const contained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
     try testing.expect(contained.isTrue());
@@ -816,7 +823,7 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
     try ctx.processMessage(.{
         .id = 4,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = -500 },
+        .params = .{ .type = "mouseWheel", .x = visible_x, .y = visible_y, .deltaY = -500 },
     });
     const upward = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 0 && window.scrollY === 100", null);
     try testing.expect(upward.isTrue());
